@@ -1,6 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  packages.txt — System-level packages for Streamlit Cloud (Ubuntu apt-get)
-#  GEKKO's APOPT/IPOPT solver needs these C libraries to compile and run
-# ─────────────────────────────────────────────────────────────────────────────
+
 gcc
 g++
