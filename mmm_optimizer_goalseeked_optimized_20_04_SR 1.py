@@ -814,127 +814,215 @@ def channel_roas_weighted(spends: np.ndarray, df: pd.DataFrame, use_hill: bool =
     return total
 
 
-def optimize_budget_gekko(df: pd.DataFrame, budget_constraint: float,
-                           objective: str = "profit", use_hill: bool = False) -> dict:
+def optimize_budget_gekko(df: pd.DataFrame,
+                          budget_constraint: float,
+                          objective: str = "profit",
+                          use_hill: bool = False) -> dict:
     """
-    GEKKO/APOPT optimizer — scaled formulation matching Excel Solver exactly.
+    GEKKO/APOPT optimizer — HARD CONSTRAINT VERSION
 
-    Scaled decision variable: x_i = aps_i / aps0_i  (= 1.0 at baseline)
-    This normalises the huge range of APS values (18 → 77,000) into [lo_pct, hi_pct]
-    which makes the NLP well-conditioned and avoids numerical failures.
-
-    Revenue_i = rev0_i * x_i^alpha_i
-    Spend_i   = spend0_i * x_i
-    Budget:     sum(spend0_i * x_i) == budget_constraint
-    Bounds:     lo_pct_i <= x_i <= hi_pct_i
+    FIXES:
+    ✅ Never auto-expands channel bounds
+    ✅ If budget outside feasible range -> returns warning
+    ✅ Locked Face-to-Face + huge budget handled correctly
+    ✅ Detailed results will now respect channel constraints
     """
+
     if not GEKKO_OK:
-        return {"spends": None, "success": False,
-                "message": "GEKKO not installed. Run: pip install gekko"}
+        return {
+            "spends": None,
+            "success": False,
+            "message": "GEKKO not installed. Run: pip install gekko"
+        }
 
-    n    = len(df)
+    n = len(df)
     rows = [df.iloc[i] for i in range(n)]
 
-    # Pre-compute per-channel constants in scaled space
-    aps0_arr   = np.array([float(r['activity_per_segment'])    for r in rows])
-    cpm_arr    = np.array([float(r.get('cost_per_mention', EPS)) for r in rows])
-    segs_arr   = np.array([float(r['total_segments'])           for r in rows])
-    coef_arr   = np.array([float(r['coefficient'])              for r in rows])
-    alpha_arr  = np.array([float(r['alpha'])                    for r in rows])
-    npu_arr    = np.array([float(r['net_per_unit'])             for r in rows])
-    adjf_arr   = np.array([float(r.get('Adj_Factor', 1.0))     for r in rows])
-    spend0_arr = np.array([float(r['total_spend'])              for r in rows])
+    aps0_arr = np.array([
+        float(r['activity_per_segment']) for r in rows
+    ])
 
-    # Baseline revenue per channel (for scaled objective)
-    rev0_arr = adjf_arr * coef_arr * (aps0_arr ** alpha_arr) * segs_arr * npu_arr
+    coef_arr = np.array([
+        float(r['coefficient']) for r in rows
+    ])
 
-    # Bounds on x_i = aps_i / aps0_i
-    locked_arr = np.array([1 if int(r.get('lock_spend', 0)) == 1 else 0 for r in rows])
-    lo_arr = np.array([get_bounds_aps(r)[0] / max(aps0_arr[i], EPS) for i, r in enumerate(rows)])
-    hi_arr = np.array([get_bounds_aps(r)[1] / max(aps0_arr[i], EPS) for i, r in enumerate(rows)])
+    alpha_arr = np.array([
+        float(r['alpha']) for r in rows
+    ])
 
-    # ── Feasibility check & auto-scaling for new budget ───────────────────────
-    # When budget_constraint differs from baseline, bounds may not span it.
-    # Auto-scale hi/lo for flexible (unlocked) channels so it's always feasible.
-    locked_spend  = float((spend0_arr * locked_arr).sum())
-    flex_budget   = budget_constraint - locked_spend   # budget available to flexible channels
-    flex_mask     = locked_arr == 0
+    segs_arr = np.array([
+        float(r['total_segments']) for r in rows
+    ])
 
-    # ── Feasibility guard ────────────────────────────────────────────────────
-    if flex_budget <= 0:
-        # Budget is at or below locked spend — no budget left for flexible channels
-        return {"spends": spend0_arr, "success": False,
-                "message": (
-                    f"Budget ${budget_constraint:,.0f} is at or below locked channel spend "
-                    f"(${locked_spend:,.0f}). Increase the budget above ${locked_spend:,.0f} "
-                    f"to allow optimization of flexible channels."
-                ), "fun": None}
+    npu_arr = np.array([
+        float(r['net_per_unit']) for r in rows
+    ])
 
-    if flex_mask.any():
-        flex_min  = float((spend0_arr * lo_arr)[flex_mask].sum())
-        flex_max  = float((spend0_arr * hi_arr)[flex_mask].sum())
+    adjf_arr = np.array([
+        float(r.get('Adj_Factor', 1.0)) for r in rows
+    ])
 
-        if flex_budget > flex_max and flex_max > 0:
-            # Scale up hi bounds proportionally for flexible channels
-            scale_up = flex_budget / flex_max
-            hi_arr   = np.where(flex_mask, hi_arr * scale_up, hi_arr)
-        elif flex_budget < flex_min and flex_min > 0:
-            # Scale down lo bounds proportionally for flexible channels
-            scale_dn = flex_budget / flex_min
-            lo_arr   = np.where(flex_mask, lo_arr * scale_dn, lo_arr)
+    spend0_arr = np.array([
+        float(r['total_spend']) for r in rows
+    ])
 
-        # Warm-start: distribute flex_budget across flexible channels proportional to baseline
-        flex_base_sum = float(spend0_arr[flex_mask].sum())
-        seed_ratio    = flex_budget / flex_base_sum if flex_base_sum > 0 else 1.0
-        seed_arr      = np.where(locked_arr == 1, 1.0, seed_ratio)
-        seed_arr      = np.clip(seed_arr, lo_arr, hi_arr)
-    else:
-        seed_arr = np.ones(n)
+    rev0_arr = (
+        adjf_arr
+        * coef_arr
+        * (aps0_arr ** alpha_arr)
+        * segs_arr
+        * npu_arr
+    )
 
+    # ----------------------------------------------------------
+    # TRUE HARD BOUNDS
+    # ----------------------------------------------------------
+    locked_arr = np.array([
+        1 if int(r.get('lock_spend', 0)) == 1 else 0
+        for r in rows
+    ])
+
+    lo_arr = np.array([
+        get_bounds_aps(r)[0] / max(aps0_arr[i], EPS)
+        for i, r in enumerate(rows)
+    ])
+
+    hi_arr = np.array([
+        get_bounds_aps(r)[1] / max(aps0_arr[i], EPS)
+        for i, r in enumerate(rows)
+    ])
+
+    # ----------------------------------------------------------
+    # FEASIBILITY CHECK
+    # ----------------------------------------------------------
+    min_total = float((spend0_arr * lo_arr).sum())
+    max_total = float((spend0_arr * hi_arr).sum())
+
+    if budget_constraint < min_total:
+        return {
+            "spends": spend0_arr,
+            "success": False,
+            "message":
+                f"Budget {budget_constraint:,.0f} is BELOW minimum feasible "
+                f"channel spend {min_total:,.0f}.",
+            "fun": None,
+            "constraint_violation": True
+        }
+
+    if budget_constraint > max_total:
+        return {
+            "spends": spend0_arr,
+            "success": False,
+            "message":
+                f"Budget {budget_constraint:,.0f} EXCEEDS maximum feasible "
+                f"channel spend {max_total:,.0f}.",
+            "fun": None,
+            "constraint_violation": True
+        }
+
+    # ----------------------------------------------------------
+    # Warm start
+    # ----------------------------------------------------------
+    base_total = float(spend0_arr.sum())
+    ratio = budget_constraint / base_total if base_total > 0 else 1.0
+
+    seed_arr = np.clip(
+        np.full(n, ratio),
+        lo_arr,
+        hi_arr
+    )
+
+    # ----------------------------------------------------------
+    # Build model
+    # ----------------------------------------------------------
     m = GEKKO(remote=False)
-    m.options.SOLVER   = 1      # APOPT — robust for this problem class
+
+    m.options.SOLVER = 1
     m.options.MAX_ITER = 2000
-    m.options.RTOL     = 1e-10
-    m.options.OTOL     = 1e-10
-    m.options.IMODE    = 3
+    m.options.IMODE = 3
+    m.options.RTOL = 1e-9
+    m.options.OTOL = 1e-9
 
-    # Decision variables x_i — warm-started at proportional seed
-    x_v = [m.Var(value=float(seed_arr[i]), lb=float(lo_arr[i]), ub=float(hi_arr[i])) for i in range(n)]
+    x_v = [
+        m.Var(
+            value=float(seed_arr[i]),
+            lb=float(lo_arr[i]),
+            ub=float(hi_arr[i])
+        )
+        for i in range(n)
+    ]
 
-    # Budget equality: sum(spend0_i * x_i) = budget_constraint
-    m.Equation(m.sum([x_v[i] * float(spend0_arr[i]) for i in range(n)]) == budget_constraint)
+    # HARD exact budget
+    m.Equation(
+        m.sum([
+            x_v[i] * float(spend0_arr[i])
+            for i in range(n)
+        ]) == budget_constraint
+    )
 
-    # Build objective terms
+    # ----------------------------------------------------------
+    # Objective functions
+    # ----------------------------------------------------------
+    def revenue_term(i):
+        return float(rev0_arr[i]) * (
+            x_v[i] ** float(alpha_arr[i])
+        )
+
     def profit_term(i):
-        rev_i = float(rev0_arr[i]) * (x_v[i] ** float(alpha_arr[i]))
+        rev_i = revenue_term(i)
         spd_i = float(spend0_arr[i]) * x_v[i]
         return rev_i - spd_i
 
-    def revenue_term(i):
-        return float(rev0_arr[i]) * (x_v[i] ** float(alpha_arr[i]))
-
     def roas_term(i):
-        rev_i = float(rev0_arr[i]) * (x_v[i] ** float(alpha_arr[i]))
+        rev_i = revenue_term(i)
         spd_i = float(spend0_arr[i]) * x_v[i] + EPS
         return rev_i / spd_i
 
     if objective == "profit":
-        m.Maximize(m.sum([profit_term(i) for i in range(n)]))
-    elif objective == "revenue":
-        m.Maximize(m.sum([revenue_term(i) for i in range(n)]))
-    else:  # roas
-        m.Maximize(m.sum([roas_term(i) for i in range(n)]))
+        m.Maximize(
+            m.sum([profit_term(i) for i in range(n)])
+        )
 
+    elif objective == "revenue":
+        m.Maximize(
+            m.sum([revenue_term(i) for i in range(n)])
+        )
+
+    else:
+        m.Maximize(
+            m.sum([roas_term(i) for i in range(n)])
+        )
+
+    # ----------------------------------------------------------
+    # Solve
+    # ----------------------------------------------------------
     try:
         m.solve(disp=False)
-        x_opt     = np.array([float(x_v[i].value[0]) for i in range(n)])
-        opt_spend = spend0_arr * x_opt          # undo scaling → spend space
-        return {"spends": opt_spend, "success": True,
-                "message": "GEKKO/APOPT converged (scaled formulation)",
-                "fun": None}
+
+        x_opt = np.array([
+            float(x_v[i].value[0])
+            for i in range(n)
+        ])
+
+        opt_spend = spend0_arr * x_opt
+
+        return {
+            "spends": opt_spend,
+            "success": True,
+            "message": "GEKKO solved with hard constraints.",
+            "fun": None,
+            "constraint_violation": False
+        }
+
     except Exception as e:
-        return {"spends": spend0_arr, "success": False,
-                "message": f"GEKKO failed: {e}. Showing baseline.", "fun": None}
+
+        return {
+            "spends": spend0_arr,
+            "success": False,
+            "message": f"Optimization failed: {e}",
+            "fun": None,
+            "constraint_violation": True
+        }
 
 
 def optimize_budget_slsqp(df: pd.DataFrame, budget_constraint: float,
@@ -1032,112 +1120,254 @@ def optimize_budget(df: pd.DataFrame, budget_constraint: float,
         return optimize_budget_slsqp(df, budget_constraint, objective, use_hill, method)
 
 
-def find_optimal_budget(df: pd.DataFrame, use_hill: bool = False,
-                         use_log: bool = False,
-                         lo_pct: float = 0.7,
-                         hi_pct: float = 1.5,
-                         increment: float = 1_000_000.0) -> dict:
+def find_optimal_budget(df: pd.DataFrame,
+                        use_hill: bool = False,
+                        use_log: bool = False,
+                        lo_pct: float = 0.7,
+                        hi_pct: float = 1.5,
+                        increment: float = 1_000_000.0,
+                        respect_bounds: bool = False,
+                        strict_feasible: bool = False,
+                        objective: str = "profit") -> dict:
     """
     Scan total budgets from lo_pct to hi_pct of baseline in fixed $ increments
-    to find the budget that maximises PROFIT (revenue - spend).
+    to find the budget that maximises the selected objective (profit or revenue).
 
-    Uses increment-based scanning (e.g. every $1M) rather than fixed n_points,
-    giving round-number budgets that are easier to present to finance teams.
-    Both lo_budget and hi_budget are rounded to the nearest increment so the
-    scan always starts and ends at clean numbers.
-
-    Key insight: profit peaks when the marginal cost of additional
-    budget equals the marginal revenue — i.e. mROI = 1 across all channels.
-    Beyond that point, each extra dollar costs more than it returns.
+    NEW ROBUST FIX:
+    - respect_bounds=True      -> validates channel min/max bounds
+    - strict_feasible=True    -> excludes infeasible budgets from scan
+    - returns infeasible_points count
+    - returns constraint_warning flag
+    - objective: "profit" (default) or "revenue" — controls which metric is maximised
     """
-    locked_arr      = df['lock_spend'].astype(int).values
-    spend0_arr      = df['total_spend'].values
-    locked_spend    = float((spend0_arr * locked_arr).sum())
+
+    locked_arr = df['lock_spend'].astype(int).values
+    spend0_arr = df['total_spend'].values
+
+    locked_spend = float((spend0_arr * locked_arr).sum())
     baseline_budget = float(spend0_arr.sum())
 
-    # Round lo/hi to nearest increment for clean round-number scan points
-    lo_raw    = max(baseline_budget * lo_pct, locked_spend * 1.01)
-    hi_raw    = baseline_budget * hi_pct
+    # Clean rounded scan range
+    lo_raw = max(baseline_budget * lo_pct, locked_spend * 1.01)
+    hi_raw = baseline_budget * hi_pct
+
     lo_budget = max(round(lo_raw / increment) * increment, increment)
     hi_budget = round(hi_raw / increment) * increment
 
-    # Guard: ensure at least 2 scan points
     if hi_budget <= lo_budget:
         hi_budget = lo_budget + increment
 
-    budgets = np.arange(lo_budget, hi_budget + increment * 0.5, increment)
+    budgets = np.arange(
+        lo_budget,
+        hi_budget + increment * 0.5,
+        increment
+    )
+
     results = []
+    infeasible_points = 0
+    any_constraint_warning = False
 
+    # ──────────────────────────────────────────────────────────────
+    # Scan all candidate budgets
+    # ──────────────────────────────────────────────────────────────
     for bgt in budgets:
-        res = optimize_budget_gekko(df, float(bgt), objective="profit",
-                                     use_hill=use_hill)
+
+        res = optimize_budget_gekko(
+            df,
+            float(bgt),
+            objective=objective,
+            use_hill=use_hill
+        )
+
         if res["success"] and res["spends"] is not None:
-            opt_sp  = float(res["spends"].sum())
-            opt_rev = sum(revenue_from_spend(res["spends"][i], df.iloc[i],
-                                              use_hill, use_log)
-                          for i in range(len(df)))
-            opt_pf  = opt_rev - opt_sp
-            results.append({"budget": bgt, "opt_spend": opt_sp,
-                             "opt_revenue": opt_rev, "opt_profit": opt_pf})
+
+            spends = np.array(res["spends"]).astype(float)
+
+            # ------------------------------------------------------
+            # Check channel bounds
+            # ------------------------------------------------------
+            violations = []
+
+            if respect_bounds:
+
+                for i in range(len(df)):
+
+                    row = df.iloc[i]
+
+                    base_spend = float(row["total_spend"])
+                    opt_spend = float(spends[i])
+
+                    lb = base_spend * float(row["lower_bound_pct"])
+                    ub = base_spend * float(row["upper_bound_pct"])
+
+                    if opt_spend < lb:
+                        violations.append({
+                            "channel": row["channel"],
+                            "type": "below",
+                            "actual": opt_spend,
+                            "min": lb
+                        })
+
+                    if opt_spend > ub:
+                        violations.append({
+                            "channel": row["channel"],
+                            "type": "above",
+                            "actual": opt_spend,
+                            "max": ub
+                        })
+
+            # If strict mode, skip infeasible budgets
+            if strict_feasible and len(violations) > 0:
+                infeasible_points += 1
+                continue
+
+            if len(violations) > 0:
+                any_constraint_warning = True
+
+            # ------------------------------------------------------
+            # Compute revenue / profit
+            # ------------------------------------------------------
+            opt_sp = float(spends.sum())
+
+            opt_rev = sum(
+                revenue_from_spend(
+                    spends[i],
+                    df.iloc[i],
+                    use_hill,
+                    use_log
+                )
+                for i in range(len(df))
+            )
+
+            opt_pf = opt_rev - opt_sp
+
+            results.append({
+                "budget": bgt,
+                "opt_spend": opt_sp,
+                "opt_revenue": opt_rev,
+                "opt_profit": opt_pf
+            })
+
         else:
-            results.append({"budget": bgt, "opt_spend": bgt,
-                             "opt_revenue": np.nan, "opt_profit": np.nan})
+            results.append({
+                "budget": bgt,
+                "opt_spend": bgt,
+                "opt_revenue": np.nan,
+                "opt_profit": np.nan
+            })
 
+    # ──────────────────────────────────────────────────────────────
+    # Convert results
+    # ──────────────────────────────────────────────────────────────
     scan_df = pd.DataFrame(results).dropna()
+
     if scan_df.empty:
-        return {"optimal_budget": baseline_budget, "optimal_profit": np.nan,
-                "scan_df": pd.DataFrame(), "success": False}
+        return {
+            "optimal_budget": baseline_budget,
+            "optimal_profit": np.nan,
+            "scan_df": pd.DataFrame(),
+            "success": False,
+            "infeasible_points": infeasible_points,
+            "constraint_warning": True
+        }
 
-    best_idx = scan_df["opt_profit"].idxmax()
+    # Select best budget based on the correct objective metric
+    _scan_metric = "opt_revenue" if objective == "revenue" else "opt_profit"
+    best_idx = scan_df[_scan_metric].idxmax()
 
-    # ── Refine: fit a quadratic around the peak scan point to interpolate
-    # the true profit-maximising budget independent of increment size.
-    # Uses the 3 points centred on the peak (or 2 if at boundary).
-    # This means the Optimal budget is stable regardless of whether the
-    # user scans at $500K, $1M or $5M increments.
+    # ──────────────────────────────────────────────────────────────
+    # Refine using quadratic interpolation
+    # ──────────────────────────────────────────────────────────────
     try:
         n = len(scan_df)
+
         lo_i = max(0, best_idx - 1)
         hi_i = min(n - 1, best_idx + 1)
-        _fit_x = scan_df["budget"].iloc[lo_i : hi_i + 1].values
-        _fit_y = scan_df["opt_profit"].iloc[lo_i : hi_i + 1].values
+
+        _fit_x = scan_df["budget"].iloc[lo_i:hi_i + 1].values
+        _fit_y = scan_df[_scan_metric].iloc[lo_i:hi_i + 1].values
+
         if len(_fit_x) >= 3:
-            # Fit quadratic ax²+bx+c; peak at x = -b/(2a)
+
             _coeffs = np.polyfit(_fit_x, _fit_y, 2)
-            _a, _b = _coeffs[0], _coeffs[1]
-            if _a < 0:   # concave → valid maximum exists
+
+            _a = _coeffs[0]
+            _b = _coeffs[1]
+
+            if _a < 0:
+
                 _interp_budget = -_b / (2 * _a)
-                # Clamp to scan range and round to nearest $500K for clean display
-                _interp_budget = float(np.clip(_interp_budget, scan_df["budget"].min(),
-                                                scan_df["budget"].max()))
-                _interp_budget = round(_interp_budget / 500_000) * 500_000
-                # Re-evaluate profit at interpolated budget
-                _ref_res = optimize_budget_gekko(df, _interp_budget,
-                                                  objective="profit", use_hill=use_hill)
-                if _ref_res.get("success") and _ref_res.get("spends") is not None:
-                    _ref_rev = sum(revenue_from_spend(_ref_res["spends"][i], df.iloc[i],
-                                                       use_hill, use_log)
-                                   for i in range(len(df)))
-                    _ref_pf  = _ref_rev - _interp_budget
+
+                _interp_budget = float(
+                    np.clip(
+                        _interp_budget,
+                        scan_df["budget"].min(),
+                        scan_df["budget"].max()
+                    )
+                )
+
+                _interp_budget = round(
+                    _interp_budget / 500_000
+                ) * 500_000
+
+                _ref_res = optimize_budget_gekko(
+                    df,
+                    _interp_budget,
+                    objective=objective,
+                    use_hill=use_hill
+                )
+
+                if (
+                    _ref_res.get("success")
+                    and _ref_res.get("spends") is not None
+                ):
+
+                    _ref_spends = np.array(_ref_res["spends"]).astype(float)
+
+                    _ref_rev = sum(
+                        revenue_from_spend(
+                            _ref_spends[i],
+                            df.iloc[i],
+                            use_hill,
+                            use_log
+                        )
+                        for i in range(len(df))
+                    )
+
+                    _ref_pf = _ref_rev - _interp_budget
+                    _ref_metric = _ref_rev if objective == "revenue" else _ref_pf
+
                     opt_budget = _interp_budget
-                    opt_profit = _ref_pf
+                    opt_profit = _ref_metric
+
                 else:
                     opt_budget = float(scan_df.loc[best_idx, "budget"])
-                    opt_profit = float(scan_df.loc[best_idx, "opt_profit"])
+                    opt_profit = float(scan_df.loc[best_idx, _scan_metric])
+
             else:
                 opt_budget = float(scan_df.loc[best_idx, "budget"])
-                opt_profit = float(scan_df.loc[best_idx, "opt_profit"])
+                opt_profit = float(scan_df.loc[best_idx, _scan_metric])
+
         else:
             opt_budget = float(scan_df.loc[best_idx, "budget"])
-            opt_profit = float(scan_df.loc[best_idx, "opt_profit"])
+            opt_profit = float(scan_df.loc[best_idx, _scan_metric])
+
     except Exception:
+
         opt_budget = float(scan_df.loc[best_idx, "budget"])
-        opt_profit = float(scan_df.loc[best_idx, "opt_profit"])
+        opt_profit = float(scan_df.loc[best_idx, _scan_metric])
 
-    return {"optimal_budget": opt_budget, "optimal_profit": opt_profit,
-            "scan_df": scan_df, "success": True}
-
-
+    # ──────────────────────────────────────────────────────────────
+    # Final return
+    # ──────────────────────────────────────────────────────────────
+    return {
+        "optimal_budget": opt_budget,
+        "optimal_profit": opt_profit,
+        "scan_df": scan_df,
+        "success": True,
+        "infeasible_points": infeasible_points,
+        "constraint_warning": any_constraint_warning
+    }
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1194,27 +1424,29 @@ def channel_color(i: int) -> str:
 #  HEADER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown(f"""
-<div style='display:flex;align-items:center;gap:1rem;padding:0 0 .75rem'>
-    <div style='width:40px;height:40px;border-radius:10px;background:{"#065AC7D2"};
-                display:flex;align-items:center;justify-content:center;
-                font-size:1.3rem;box-shadow:0 4px 12px rgba(26,86,219,.3);flex-shrink:0'>&#x2B21;</div>
-    <div>
-        <div style='font-size:1.45rem;font-weight:800;letter-spacing:-.03em;
-                    color:{'#CC5500'};line-height:1.1'>
-            MMM <span style='color:{'#002F6C'}'>Scenario Recommendation & Optimization Engine</span>
-            <span style='font-size:.75rem;font-weight:500;color:{PALETTE["muted"]};
-                         background:{PALETTE["surface2"]};border:1.5px solid {PALETTE["border"]};
-                         border-radius:6px;padding:1px 8px;margin-left:.5rem;
-                         vertical-align:middle;letter-spacing:.04em'>PRO</span>
-        </div>
-        <div style='font-size:.68rem;color:{PALETTE["muted2"]};margin-top:.2rem;
-                    letter-spacing:.08em;text-transform:uppercase'>
-            Marketing Mix Modeling &nbsp;&#183;&nbsp; Power &amp; Hill Response Curves &nbsp;&#183;&nbsp; Multi-Objective Optimization
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+_hdr_mu   = PALETTE["muted"];   _hdr_surf2 = PALETTE["surface2"]
+_hdr_bdr  = PALETTE["border"]; _hdr_mu2   = PALETTE["muted2"]
+st.markdown(
+    f"<div style='display:flex;align-items:center;gap:1rem;padding:0 0 .75rem'>"
+    f"<div style='width:40px;height:40px;border-radius:10px;background:#065AC7D2;"
+    f"display:flex;align-items:center;justify-content:center;"
+    f"font-size:1.3rem;box-shadow:0 4px 12px rgba(26,86,219,.3);flex-shrink:0'>&#x2B21;</div>"
+    f"<div>"
+    f"<div style='font-size:1.45rem;font-weight:800;letter-spacing:-.03em;"
+    f"color:#CC5500;line-height:1.1'>"
+    f"MMM <span style='color:#002F6C'>Scenario Recommendation &amp; Optimization Engine</span>"
+    f"<span style='font-size:.75rem;font-weight:500;color:{_hdr_mu};"
+    f"background:{_hdr_surf2};border:1.5px solid {_hdr_bdr};"
+    f"border-radius:6px;padding:1px 8px;margin-left:.5rem;"
+    f"vertical-align:middle;letter-spacing:.04em'>PRO</span>"
+    f"</div>"
+    f"<div style='font-size:.68rem;color:{_hdr_mu2};margin-top:.2rem;"
+    f"letter-spacing:.08em;text-transform:uppercase'>"
+    f"Marketing Mix Modeling &nbsp;&#183;&nbsp; Power &amp; Hill Response Curves "
+    f"&nbsp;&#183;&nbsp; Multi-Objective Optimization"
+    f"</div></div></div>",
+    unsafe_allow_html=True
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1431,31 +1663,39 @@ with st.sidebar:
 
     st.markdown(f"<div style='height:.5rem'></div>", unsafe_allow_html=True)
     with st.expander("📋 Schema reference", expanded=False):
-        st.markdown(f"""
-<div style='font-size:.75rem;color:{PALETTE["muted"]}'>
-<b>Required columns:</b><br>
-• channel, total_activity, total_spend<br>
-• total_sales, coefficient<br>
-• type_transformation (power/log/hill)<br>
-• alpha, lock_spend (0/1)<br>
-• lower_bound_pct, upper_bound_pct<br>
-• total_segments, net_per_unit<br><br>
-<b>Optional:</b> hill_ec50, hill_slope, hill_max_response
-</div>
-""", unsafe_allow_html=True)
+        _schema_muted = PALETTE["muted"]
+        st.markdown(
+            f"<div style='font-size:.75rem;color:{_schema_muted}'>"
+            f"<b>Required columns:</b><br>"
+            f"• channel, total_activity, total_spend<br>"
+            f"• total_sales, coefficient<br>"
+            f"• type_transformation (power/log/hill)<br>"
+            f"• alpha, lock_spend (0/1)<br>"
+            f"• lower_bound_pct, upper_bound_pct<br>"
+            f"• total_segments, net_per_unit<br><br>"
+            f"<b>Optional:</b> hill_ec50, hill_slope, hill_max_response"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOAD & VALIDATE DATA
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if uploaded is None:
-    st.markdown(f"""
-    <div style='margin-top:3rem;text-align:center;padding:3rem;background:{PALETTE["surface"]};border-radius:16px;border:2px dashed {PALETTE["border"]}'>
-        <div style='font-size:2.5rem;margin-bottom:1rem'>⬡</div>
-        <div style='font-size:1.1rem;font-weight:600;color:{PALETTE["text"]};margin-bottom:.5rem'>Upload your MMM input file to begin</div>
-        <div style='font-size:.82rem;color:{PALETTE["muted"]}'>Accepts CSV or Excel • Power, Log & Hill response curves • Multi-channel optimization</div>
-    </div>
-    """, unsafe_allow_html=True)
+    _up_surf = PALETTE["surface"]; _up_bdr = PALETTE["border"]
+    _up_txt  = PALETTE["text"];    _up_mu  = PALETTE["muted"]
+    st.markdown(
+        f"<div style='margin-top:3rem;text-align:center;padding:3rem;"
+        f"background:{_up_surf};border-radius:16px;border:2px dashed {_up_bdr}'>"
+        f"<div style='font-size:2.5rem;margin-bottom:1rem'>⬡</div>"
+        f"<div style='font-size:1.1rem;font-weight:600;color:{_up_txt};margin-bottom:.5rem'>"
+        f"Upload your MMM input file to begin</div>"
+        f"<div style='font-size:.82rem;color:{_up_mu}'>"
+        f"Accepts CSV or Excel • Power, Log & Hill response curves • Multi-channel optimization</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
     st.stop()
 
 raw_bytes = uploaded.read()
@@ -1677,36 +1917,40 @@ with tab_rc:
         lo_act_disp = (base_sp * lo_pct / cpm) if cpm > 0 else base_sp * lo_pct
         hi_act_disp = (base_sp * hi_pct / cpm) if cpm > 0 else base_sp * hi_pct
 
-        st.markdown(f"""
-        <div style='background:{PALETTE["surface"]};border:1.5px solid {PALETTE["border"]};
-                    border-radius:14px;padding:.9rem 1rem;box-shadow:0 1px 4px rgba(0,0,0,.05);
-                    border-top:3px solid {col_hex}'>
-            <div style='font-size:.62rem;font-weight:700;text-transform:uppercase;
-                        letter-spacing:.09em;color:{PALETTE["muted"]};margin-bottom:.6rem'>
-                {selected_ch}
-                &nbsp;<span style='color:{PALETTE["accent4"]}'>{rrow["type_transformation"].upper()}</span>
-                &nbsp;<span style='color:{PALETTE["gold"]}'>{lock_str}</span>
-            </div>
-            <div style='display:grid;grid-template-columns:1fr 1fr;gap:.45rem'>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>Spend</div>
-                     <div style='font-size:.92rem;font-weight:700'>{fmt(curr_sp,"$")}</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>Activity</div>
-                     <div style='font-size:.92rem;font-weight:700'>{fmt(curr_act)}</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>Revenue</div>
-                     <div style='font-size:.92rem;font-weight:700'>{fmt(curr_rev,"$")}</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>Profit</div>
-                     <div style='font-size:.92rem;font-weight:700;color:{PALETTE["accent2"]}'>{fmt(curr_prof,"$")}</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>ROI</div>
-                     <div style='font-size:.92rem;font-weight:700'>{roas_val:.2f}×</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>mROI</div>
-                     <div style='font-size:.92rem;font-weight:700'>{mroi_val:.2f}×</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>Alpha</div>
-                     <div style='font-size:.92rem;font-weight:700;color:{PALETTE["accent4"]}'>{float(rrow["alpha"]):.3f}</div></div>
-                <div><div style='font-size:.58rem;color:{PALETTE["muted2"]}'>Adj Factor</div>
-                     <div style='font-size:.92rem;font-weight:700'>{float(rrow["Adj_Factor"]):.3f}</div></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        _c_surf  = PALETTE["surface"];  _c_bdr   = PALETTE["border"]
+        _c_mu    = PALETTE["muted"];    _c_mu2   = PALETTE["muted2"]
+        _c_acc4  = PALETTE["accent4"];  _c_gold  = PALETTE["gold"]
+        _c_acc2  = PALETTE["accent2"]
+        st.markdown(
+            f"<div style='background:{_c_surf};border:1.5px solid {_c_bdr};"
+            f"border-radius:14px;padding:.9rem 1rem;box-shadow:0 1px 4px rgba(0,0,0,.05);"
+            f"border-top:3px solid {col_hex}'>"
+            f"<div style='font-size:.62rem;font-weight:700;text-transform:uppercase;"
+            f"letter-spacing:.09em;color:{_c_mu};margin-bottom:.6rem'>"
+            f"{selected_ch}"
+            f"&nbsp;<span style='color:{_c_acc4}'>{rrow['type_transformation'].upper()}</span>"
+            f"&nbsp;<span style='color:{_c_gold}'>{lock_str}</span>"
+            f"</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:.45rem'>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>Spend</div>"
+            f"<div style='font-size:.92rem;font-weight:700'>{fmt(curr_sp,'$')}</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>Activity</div>"
+            f"<div style='font-size:.92rem;font-weight:700'>{fmt(curr_act)}</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>Revenue</div>"
+            f"<div style='font-size:.92rem;font-weight:700'>{fmt(curr_rev,'$')}</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>Profit</div>"
+            f"<div style='font-size:.92rem;font-weight:700;color:{_c_acc2}'>{fmt(curr_prof,'$')}</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>ROI</div>"
+            f"<div style='font-size:.92rem;font-weight:700'>{roas_val:.2f}×</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>mROI</div>"
+            f"<div style='font-size:.92rem;font-weight:700'>{mroi_val:.2f}×</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>Alpha</div>"
+            f"<div style='font-size:.92rem;font-weight:700;color:{_c_acc4}'>{float(rrow['alpha']):.3f}</div></div>"
+            f"<div><div style='font-size:.58rem;color:{_c_mu2}'>Adj Factor</div>"
+            f"<div style='font-size:.92rem;font-weight:700'>{float(rrow['Adj_Factor']):.3f}</div></div>"
+            f"</div></div>",
+            unsafe_allow_html=True
+        )
 
         st.markdown(f"<div class='alert-box {sat_cls}' style='margin-top:.6rem;font-size:.77rem'>{sat_msg}</div>",
                     unsafe_allow_html=True)
@@ -1714,33 +1958,38 @@ with tab_rc:
         # Optimizer bounds
         bounds_txt = (f"Fixed at {fmt(base_sp,'$')}" if lock_val
                       else f"{fmt(base_sp*lo_pct,'$')} – {fmt(base_sp*hi_pct,'$')}")
-        st.markdown(f"""
-        <div style='font-size:.68rem;color:{PALETTE["muted"]};margin-top:.5rem;
-                    background:{PALETTE["surface2"]};border-radius:8px;padding:.45rem .65rem;
-                    border:1px solid {PALETTE["border"]}'>
-            <b>Optimizer bounds:</b> {bounds_txt}
-        </div>""", unsafe_allow_html=True)
+        _ob_mu   = PALETTE["muted"]; _ob_surf2 = PALETTE["surface2"]; _ob_bdr = PALETTE["border"]
+        st.markdown(
+            f"<div style='font-size:.68rem;color:{_ob_mu};margin-top:.5rem;"
+            f"background:{_ob_surf2};border-radius:8px;padding:.45rem .65rem;"
+            f"border:1px solid {_ob_bdr}'>"
+            f"<b>Optimizer bounds:</b> {bounds_txt}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
         if has_opt:
             delta_p = opt_prof - curr_prof
-            st.markdown(f"""
-            <div style='background:{PALETTE["accent2_lt"]};border:1.5px solid #A7F3D0;
-                        border-radius:10px;padding:.65rem .85rem;margin-top:.55rem'>
-                <div style='font-size:.6rem;font-weight:700;text-transform:uppercase;
-                            letter-spacing:.07em;color:{PALETTE["accent2"]};margin-bottom:.35rem'>
-                    Optimized
-                </div>
-                <div style='display:grid;grid-template-columns:1fr 1fr;gap:.35rem;font-size:.82rem'>
-                    <div><div style='font-size:.55rem;color:{PALETTE["accent2"]}'>Spend</div>
-                         <b>{fmt(opt_sp,"$")}</b></div>
-                    <div><div style='font-size:.55rem;color:{PALETTE["accent2"]}'>Activity</div>
-                         <b>{fmt(opt_act)}</b></div>
-                    <div><div style='font-size:.55rem;color:{PALETTE["accent2"]}'>Profit</div>
-                         <b style='color:{PALETTE["accent2"]}'>{fmt(opt_prof,"$")}</b></div>
-                    <div><div style='font-size:.55rem;color:{PALETTE["accent2"]}'>Delta</div>
-                         <b style='color:{"#057A55" if delta_p>=0 else "#C81E1E"}'>{fmt(delta_p,"$","+") if delta_p>=0 else fmt(delta_p,"$")}</b></div>
-                </div>
-            </div>""", unsafe_allow_html=True)
+            _oa2    = PALETTE["accent2"]; _oa2lt = PALETTE["accent2_lt"]
+            _dp_col = "#057A55" if delta_p >= 0 else "#C81E1E"
+            _dp_val = fmt(delta_p, "$", "+") if delta_p >= 0 else fmt(delta_p, "$")
+            st.markdown(
+                f"<div style='background:{_oa2lt};border:1.5px solid #A7F3D0;"
+                f"border-radius:10px;padding:.65rem .85rem;margin-top:.55rem'>"
+                f"<div style='font-size:.6rem;font-weight:700;text-transform:uppercase;"
+                f"letter-spacing:.07em;color:{_oa2};margin-bottom:.35rem'>Optimized</div>"
+                f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:.35rem;font-size:.82rem'>"
+                f"<div><div style='font-size:.55rem;color:{_oa2}'>Spend</div>"
+                f"<b>{fmt(opt_sp,'$')}</b></div>"
+                f"<div><div style='font-size:.55rem;color:{_oa2}'>Activity</div>"
+                f"<b>{fmt(opt_act)}</b></div>"
+                f"<div><div style='font-size:.55rem;color:{_oa2}'>Profit</div>"
+                f"<b style='color:{_oa2}'>{fmt(opt_prof,'$')}</b></div>"
+                f"<div><div style='font-size:.55rem;color:{_oa2}'>Delta</div>"
+                f"<b style='color:{_dp_col}'>{_dp_val}</b></div>"
+                f"</div></div>",
+                unsafe_allow_html=True
+            )
         else:
             st.markdown(f"<div class='alert-box alert-info' style='margin-top:.55rem;font-size:.72rem'>Run Budget Optimization to annotate the optimal point.</div>",
                         unsafe_allow_html=True)
@@ -1857,6 +2106,54 @@ with tab_rc:
                                   line_color=PALETTE["accent2"], line_width=1.2,
                                   opacity=0.6)
 
+            # ── Bound lines (skip for locked channels) ────────────────────────
+            if not lock_val:
+                lo_pct_line = lo_pct * 100   # lower_bound_pct → %
+                hi_pct_line = hi_pct * 100   # upper_bound_pct → %
+                lo_sp_line  = base_sp * lo_pct
+                hi_sp_line  = base_sp * hi_pct
+                # Lower bound
+                fig_rc.add_vline(
+                    x=lo_pct_line,
+                    line=dict(color="#F59E0B", width=1.5, dash="dot"),
+                    opacity=0.75,
+                    annotation_text=f"Min: {fmt(lo_sp_line,'$')}",
+                    annotation_position="top right",
+                    annotation_font=dict(size=8, color="#B45309"),
+                    annotation_bgcolor="rgba(255,251,235,0.9)",
+                    annotation_bordercolor="#F59E0B",
+                    annotation_borderwidth=1,
+                )
+                # Upper bound
+                fig_rc.add_vline(
+                    x=hi_pct_line,
+                    line=dict(color="#F59E0B", width=1.5, dash="dot"),
+                    opacity=0.75,
+                    annotation_text=f"Max: {fmt(hi_sp_line,'$')}",
+                    annotation_position="top left",
+                    annotation_font=dict(size=8, color="#B45309"),
+                    annotation_bgcolor="rgba(255,251,235,0.9)",
+                    annotation_bordercolor="#F59E0B",
+                    annotation_borderwidth=1,
+                )
+                # Shaded feasible region between bounds
+                lo_y = float(min(curve_data))
+                hi_y = float(max(curve_data)) * 1.05
+                fig_rc.add_vrect(
+                    x0=lo_pct_line, x1=hi_pct_line,
+                    fillcolor="rgba(245,158,11,0.06)",
+                    line_width=0,
+                    layer="below"
+                )
+
+            # Add legend entries for bound lines if not locked
+            if not lock_val:
+                fig_rc.add_trace(go.Scatter(
+                    x=[None], y=[None], mode='lines',
+                    line=dict(color="#F59E0B", width=1.5, dash="dot"),
+                    name="Optimizer Bounds (Min/Max)"
+                ))
+
             fig_rc.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FAFBFC",
                 font=dict(family="Inter, system-ui, sans-serif", color=PALETTE["text2"]),
@@ -1942,6 +2239,26 @@ with tab_rc:
                                        f"{'Profit' if curve_type == 'Profit Curve' else 'Revenue'}: ${opt_val:,.0f}<extra></extra>")
                     ))
 
+                # ── Bound lines for this channel (colour-matched) ─────────────
+                if not int(row.get('lock_spend', 0)) == 1:
+                    _lo_pct_ov = float(row.get('lower_bound_pct', 0.5)) * 100
+                    _hi_pct_ov = float(row.get('upper_bound_pct', 1.5)) * 100
+                    _lo_sp_ov  = b_sp * float(row.get('lower_bound_pct', 0.5))
+                    _hi_sp_ov  = b_sp * float(row.get('upper_bound_pct', 1.5))
+                    for _bpct, _bsp, _blabel in [
+                        (_lo_pct_ov, _lo_sp_ov, "Min Bound"),
+                        (_hi_pct_ov, _hi_sp_ov, "Max Bound"),
+                    ]:
+                        fig_all.add_trace(go.Scatter(
+                            x=[_bpct, _bpct], y=[0, 1],
+                            mode='lines',
+                            line=dict(color=col_c, width=1, dash="dot"),
+                            opacity=0.45,
+                            showlegend=False,
+                            hovertemplate=(f"<b>{row['channel']} — {_blabel}</b><br>"
+                                           f"Spend: ${_bsp:,.0f} ({_bpct:.0f}%)<extra></extra>"),
+                        ))
+
             fig_all.add_hline(y=0, line_color="#CBD0D8", line_width=1)
             fig_all.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FAFBFC",
@@ -1978,6 +2295,13 @@ with tab_rc:
             tbl_rows = []
             prev_rv  = None   # for mROI_Sales calculation
             prev_sp  = None
+
+            # Pre-compute bound spend values for this channel
+            _tbl_lo_sp = base_sp * lo_pct   # lower_bound_pct × baseline_spend
+            _tbl_hi_sp = base_sp * hi_pct   # upper_bound_pct × baseline_spend
+            _tbl_lo_pct = lo_pct * 100
+            _tbl_hi_pct = hi_pct * 100
+
             for pct in all_pcts:
                 sp   = base_sp * pct / 100
                 act  = sp / cpm if cpm > 0 else sp   # total_activity at this spend
@@ -2002,6 +2326,20 @@ with tab_rc:
                 is_curr = (round(pct) == round(curr_pct))
                 is_opt  = has_opt and (round(pct) == round(opt_pct))
 
+                # Bound status
+                if lock_val:
+                    in_bounds = True   # locked channel — always "at bound"
+                    bound_label = "🔒 Locked"
+                elif sp < _tbl_lo_sp - 1:
+                    in_bounds = False
+                    bound_label = "⬇ Below Min"
+                elif sp > _tbl_hi_sp + 1:
+                    in_bounds = False
+                    bound_label = "⬆ Above Max"
+                else:
+                    in_bounds = True
+                    bound_label = "✓"
+
                 def _fmt(v, decimals=2):
                     if pd.isna(v): return "—"
                     return f"{v:,.{decimals}f}"
@@ -2010,10 +2348,15 @@ with tab_rc:
                     '_pct':    pct,
                     '_is_curr': is_curr,
                     '_is_opt':  is_opt,
+                    '_in_bounds': in_bounds,
+                    '_bound_label': bound_label,
                     '_sp': sp, '_rv': rv, '_pf': pf,
                     'Investment_%':  str(round(pct)) + "%",
                     'Total_Activity':_fmt(act, 0),
                     'Spend':         fmt(sp,"$"),
+                    'Min Bound':     fmt(_tbl_lo_sp,"$"),
+                    'Max Bound':     fmt(_tbl_hi_sp,"$"),
+                    'Bounds':        bound_label,
                     'Impact':        fmt(rv,"$"),
                     'Profit':        fmt(pf, "$"),
                     'ROI_Profit':    _fmt(roi_pf,  2),
@@ -2023,17 +2366,19 @@ with tab_rc:
                 })
 
             # ── Colour scheme ──────────────────────────────────────────────────
-            curr_color = PALETTE["accent_lt"]
-            opt_color  = PALETTE["accent2_lt"]
-            both_color = "#FFF7ED"
-            muted_bg   = PALETTE["surface2"]
-            border     = PALETTE["border"]
-            muted_txt  = PALETTE["muted"]
-            text_col   = PALETTE["text2"]
-            green      = PALETTE["accent2"]
-            red        = PALETTE["accent3"]
-            blue       = PALETTE["accent"]
-            orange     = "#E66800"
+            curr_color  = PALETTE["accent_lt"]
+            opt_color   = PALETTE["accent2_lt"]
+            both_color  = "#FFF7ED"
+            muted_bg    = PALETTE["surface2"]
+            border      = PALETTE["border"]
+            muted_txt   = PALETTE["muted"]
+            text_col    = PALETTE["text2"]
+            green       = PALETTE["accent2"]
+            red         = PALETTE["accent3"]
+            blue        = PALETTE["accent"]
+            orange      = "#E66800"
+            out_of_bounds_bg = "#FEF3C7"   # amber tint for rows outside bounds
+
             # ── Legend ─────────────────────────────────────────────────────────
             lc = (f"<span style='display:inline-block;background:{curr_color};"
                   f"border:1.5px solid {blue};border-radius:5px;"
@@ -2041,13 +2386,23 @@ with tab_rc:
             lo = (f"<span style='display:inline-block;background:{opt_color};"
                   f"border:1.5px solid {green};border-radius:5px;"
                   f"padding:2px 10px;font-size:.72rem;font-weight:600;color:{green};margin-left:6px'>&#11044; Optimal Investment</span>") if has_opt else ""
+            lb_note = "" if lock_val else (
+                f"<span style='display:inline-block;background:{out_of_bounds_bg};"
+                f"border:1.5px solid #F59E0B;border-radius:5px;"
+                f"padding:2px 10px;font-size:.72rem;font-weight:600;color:#B45309;margin-left:6px'>"
+                f"&#9888; Outside optimizer bounds ({fmt(_tbl_lo_sp,'$')} – {fmt(_tbl_hi_sp,'$')})</span>"
+            )
 
             # ── Column headers ─────────────────────────────────────────────────
             th_style  = f"padding:.5rem .7rem;font-weight:700;font-size:.67rem;letter-spacing:.05em;text-transform:uppercase;color:#cc5500;white-space:nowrap;text-align:center"
+            th_bound  = f"padding:.5rem .7rem;font-weight:700;font-size:.67rem;letter-spacing:.05em;text-transform:uppercase;color:#B45309;white-space:nowrap;text-align:center;background:#FFFBEB"
             tr_hdr    = (f"<tr style='background:{muted_bg};border-bottom:2px solid {border}'>"
                          f"<th style='{th_style}'>Investment %</th>"
                          f"<th style='{th_style}'>Total Activity</th>"
                          f"<th style='{th_style}'>Spend</th>"
+                         f"<th style='{th_bound}'>Min Bound</th>"
+                         f"<th style='{th_bound}'>Max Bound</th>"
+                         f"<th style='{th_bound}'>In Bounds?</th>"
                          f"<th style='{th_style}'>Impact (Sales)</th>"
                          f"<th style='{th_style}'>Profit</th>"
                          f"<th style='{th_style}'>ROI Profit<br>(Profit / Spend)</th>"
@@ -2069,6 +2424,10 @@ with tab_rc:
                 else:
                     bg, fw, marker = "transparent", "400", ""
 
+                # Rows outside the optimizer bounds get an amber tint (only if no other highlight)
+                if not r['_in_bounds'] and bg == "transparent":
+                    bg = out_of_bounds_bg
+
                 # profit colour
                 try:
                     pf_num = float(r['_pf'])
@@ -2076,25 +2435,36 @@ with tab_rc:
                 except Exception:
                     pf_col = text_col
 
+                # bounds cell colour
+                if r['_bound_label'] == "✓":
+                    bnd_col = green; bnd_bg = "#ECFDF3"
+                elif r['_bound_label'] == "🔒 Locked":
+                    bnd_col = "#B45309"; bnd_bg = "#FFFBEB"
+                else:
+                    bnd_col = red; bnd_bg = "#FEF2F2"
+
+                _inv_col = blue if bg not in ("transparent", out_of_bounds_bg) else text_col
                 rows_html += (
                     f"<tr style='background:{bg};border-bottom:1px solid {border}'>"
-                    f"<td style='text-align:center;{td};font-weight:{fw};color:{blue if bg!='transparent' else text_col}'>"
+                    f"<td style='text-align:center;{td};font-weight:{fw};color:{_inv_col}'>"
                     f"{r['Investment_%']}{marker}</td>"
-                    f"<td style='text-align:center; '{td}'>{r['Total_Activity']}</td>"
-                    f"<td style='text-align:center;'{td}'>{r['Spend']}</td>"
-                    f"<td style='text-align:center;'{td}'>{r['Impact']}</td>"
-                    f"<td style='text-align:center;'{td};font-weight:{fw};color:{pf_col}'>{r['Profit']}</td>"
-                    f"<td style='text-align:center;'{td}'>{r['ROI_Profit']}</td>"
-                    f"<td style='text-align:center;'{td}'>{r['mROI_Profit']}</td>"
-                    f"<td style='text-align:center;'{td}'>{r['ROI_Sales']}</td>"
-                    f"<td style='text-align:center;'{td}'>{r['mROI_Sales']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['Total_Activity']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['Spend']}</td>"
+                    f"<td style='text-align:center;{td};background:#FFFBEB;color:#B45309;font-weight:600'>{r['Min Bound']}</td>"
+                    f"<td style='text-align:center;{td};background:#FFFBEB;color:#B45309;font-weight:600'>{r['Max Bound']}</td>"
+                    f"<td style='text-align:center;{td};background:{bnd_bg};color:{bnd_col};font-weight:600'>{r['Bounds']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['Impact']}</td>"
+                    f"<td style='text-align:center;{td};font-weight:{fw};color:{pf_col}'>{r['Profit']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['ROI_Profit']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['mROI_Profit']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['ROI_Sales']}</td>"
+                    f"<td style='text-align:center;{td}'>{r['mROI_Sales']}</td>"
                     f"</tr>"
                 )
 
             # ── Assemble & render ──────────────────────────────────────────────
             html = (
-                
-                    f"<div style='margin-bottom:.5rem;text-align:left'>{lc}{lo}</div>"
+                    f"<div style='margin-bottom:.5rem;text-align:left'>{lc}{lo}{lb_note}</div>"
                     f"<div style='width:100%;overflow-x:auto;"
                     f"border:1.5px solid {border};"
                     f"border-radius:12px;"
@@ -2125,6 +2495,9 @@ with tab_rc:
                 'Investment_%':   r['Investment_%'],
                 'Total_Activity': r['Total_Activity'],
                 'Spend':          r['Spend'],
+                'Min_Bound':      r['Min Bound'],
+                'Max_Bound':      r['Max Bound'],
+                'In_Bounds':      r['Bounds'],
                 'Impact':         r['Impact'],
                 'Profit':         r['Profit'],
                 'ROI_Profit':     r['ROI_Profit'],
@@ -2208,69 +2581,145 @@ with tab_rc:
         st.markdown(ai_output)
 
 
-    # ─────────────────────────────────────────────────────────────
-    # Mini per-channel profit response curves (checkbox controlled)
-    # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Mini per-channel response curves (checkbox controlled)
+# Updated: respects Profit/Revenue selection
+# ─────────────────────────────────────────────────────────────
 
-    if show_all_curves and PLOTLY:
+if show_all_curves and PLOTLY:
 
-        st.markdown(
-            "<div class='section-header' style='margin-top:.75rem'>"
-            "All channels · Profit response (Activity domain)</div>",
-            unsafe_allow_html=True
-        )
+    curve_header = (
+        "All channels · Profit response (Activity domain)"
+        if curve_type == "Profit Curve"
+        else "All channels · Revenue response (Activity domain)"
+    )
 
-        n_cols_mini = min(len(df), 4)
-        mini_cols = st.columns(n_cols_mini)
+    st.markdown(
+        f"<div class='section-header' style='margin-top:.75rem'>{curve_header}</div>",
+        unsafe_allow_html=True
+    )
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            with mini_cols[i % n_cols_mini]:
+    n_cols_mini = min(len(df), 4)
+    mini_cols = st.columns(n_cols_mini)
 
-                sp_r   = float(row['total_spend'])
-                col_c  = channel_color(i)
-                _hp2   = max(float(row.get('upper_bound_pct', 1.5)) * 100, 150.0)
+    for i, (_, row) in enumerate(df.iterrows()):
+        with mini_cols[i % n_cols_mini]:
 
-                pct_m  = np.linspace(0, _hp2, 300)
-                s_m    = sp_r * pct_m / 100
-                rev_m  = np.array(
-                    [revenue_from_spend(s, row, use_hill_global, use_log_global) for s in s_m]
+            sp_r   = float(row['total_spend'])
+            col_c  = channel_color(i)
+            _hp2   = max(float(row.get('upper_bound_pct', 1.5)) * 100, 150.0)
+
+            pct_m = np.linspace(0, _hp2, 300)
+            s_m   = sp_r * pct_m / 100
+
+            # Revenue curve
+            rev_m = np.array([
+                revenue_from_spend(s, row, use_hill_global, use_log_global)
+                for s in s_m
+            ])
+
+            # Dynamic curve selection
+            if curve_type == "Profit Curve":
+                curve_m = rev_m - s_m
+                y_title = "Profit ($)"
+            else:
+                curve_m = rev_m
+                y_title = "Revenue ($)"
+
+            _curve_min = float(curve_m.min())
+            _curve_max = float(curve_m.max())
+
+            _y_lo = min(_curve_min * 0.88 if _curve_min < 0 else 0, 0)
+            _y_hi = _curve_max * 1.12
+
+            f_m = go.Figure()
+
+            # Main curve
+            f_m.add_trace(go.Scatter(
+                x=pct_m,
+                y=curve_m,
+                mode='lines',
+                line=dict(color=col_c, width=2),
+                hovertemplate=(
+                    f"<b>{row['channel']}</b><br>"
+                    f"Investment: %{{x:.0f}}%<br>"
+                    f"{'Profit' if curve_type == 'Profit Curve' else 'Revenue'}: "
+                    f"$%{{y:,.0f}}<extra></extra>"
                 )
-                prof_m = rev_m - s_m
+            ))
 
-                _prof_min = float(prof_m.min())
-                _prof_max = float(prof_m.max())
-                _y_lo = min(_prof_min * 0.88 if _prof_min < 0 else 0, 0)
-                _y_hi = _prof_max * 1.12
+            # Current baseline marker (100%)
+            f_m.add_vline(
+                x=100.0,
+                line_dash='dot',
+                line_color=PALETTE["accent3"],
+                line_width=1
+            )
 
-                f_m = go.Figure()
-                f_m.add_trace(go.Scatter(
-                    x=pct_m, y=prof_m, mode='lines',
-                    line=dict(color=col_c, width=2)
-                ))
-
-                f_m.add_vline(x=100.0, line_dash='dot',
-                              line_color=PALETTE["accent3"], line_width=1)
-
-                f_m.update_layout(
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='#FAFBFC',
-                    height=250,
-                    margin = dict(l=5, r=5, t=36, b=40),
-                    showlegend=False,
-                    title=dict(text=row['channel'], font=dict(size=10)),
-                    xaxis=dict(title='% of Baseline', gridcolor='#EAECF0',
-                                   linecolor=PALETTE['border2'], ticksuffix='%',
-                                   tickfont=dict(size=8, color=PALETTE['muted']),
-                                   range=[0, _hp2]),
-                    yaxis=dict(title='Profit ($)', gridcolor='#EAECF0',
-                                   linecolor=PALETTE['border2'],
-                                   tickfont=dict(size=8, color=PALETTE['muted']),
-                                   tickformat='$.3s',
-                                   range=[_y_lo, _y_hi])
+            # Bound lines (amber dotted) — skip for locked channels
+            if not int(row.get('lock_spend', 0)) == 1:
+                _lo_m = float(row.get('lower_bound_pct', 0.5)) * 100
+                _hi_m = float(row.get('upper_bound_pct', 1.5)) * 100
+                _lo_sp_m = sp_r * float(row.get('lower_bound_pct', 0.5))
+                _hi_sp_m = sp_r * float(row.get('upper_bound_pct', 1.5))
+                f_m.add_vline(
+                    x=_lo_m,
+                    line=dict(color="#F59E0B", width=1.2, dash="dot"),
+                    opacity=0.8,
+                    annotation_text=f"Min {fmt(_lo_sp_m,'$')}",
+                    annotation_position="top right",
+                    annotation_font=dict(size=7, color="#B45309"),
+                )
+                f_m.add_vline(
+                    x=_hi_m,
+                    line=dict(color="#F59E0B", width=1.2, dash="dot"),
+                    opacity=0.8,
+                    annotation_text=f"Max {fmt(_hi_sp_m,'$')}",
+                    annotation_position="top left",
+                    annotation_font=dict(size=7, color="#B45309"),
+                )
+                f_m.add_vrect(
+                    x0=_lo_m, x1=_hi_m,
+                    fillcolor="rgba(245,158,11,0.06)",
+                    line_width=0,
+                    layer="below"
                 )
 
-                st.plotly_chart(f_m, width='stretch')
+            f_m.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='#FAFBFC',
+                height=250,
+                margin=dict(l=5, r=5, t=36, b=40),
+                showlegend=False,
+                title=dict(
+                    text=row['channel'],
+                    font=dict(size=10)
+                ),
+                xaxis=dict(
+                    title='% of Baseline',
+                    gridcolor='#EAECF0',
+                    linecolor=PALETTE['border2'],
+                    ticksuffix='%',
+                    tickfont=dict(
+                        size=8,
+                        color=PALETTE['muted']
+                    ),
+                    range=[0, _hp2]
+                ),
+                yaxis=dict(
+                    title=y_title,
+                    gridcolor='#EAECF0',
+                    linecolor=PALETTE['border2'],
+                    tickfont=dict(
+                        size=8,
+                        color=PALETTE['muted']
+                    ),
+                    tickformat='$.3s',
+                    range=[_y_lo, _y_hi]
+                )
+            )
 
+            st.plotly_chart(f_m, width='stretch')
 
 
 with tab_opt:
@@ -2292,14 +2741,75 @@ with tab_opt:
 
         _locked_spend_min = float((df['total_spend'] * df['lock_spend'].astype(int)).sum())
         _baseline_total   = float(df['total_spend'].sum())
+        
+        # Check for face-to-face channel (common pharma channel name)
+        _f2f_channels = [ch for ch in df['channel'].tolist() if 'face' in ch.lower() or 'f2f' in ch.lower() or 'f2f' in ch.lower().replace(' ','')]
+        _has_f2f = len(_f2f_channels) > 0
+        _f2f_channel = _f2f_channels[0] if _has_f2f else None
 
         # Default scan df — overridden in Model recommends budget mode if unlock is checked
         df_scan = df.copy()
+
+        # Read accept flag directly from session_state so it's always current
+        # regardless of whether the checkbox has rendered yet this pass.
+        _accept_budget_warning = bool(st.session_state.get("snb_accept_warning", False))
+        _budget_warning = False   # set True inside Set new budget block when infeasible
+
+        # ── Pre-populate override_bounds from session_state ───────────────────
+        # The Per-channel bounds expander (rendered BELOW the feasibility check)
+        # stores widget values under keys "lo_{channel}" / "hi_{channel}".
+        # By reading session_state here we ensure the feasibility check always
+        # uses the user's current bound values, not the empty-dict default.
+        override_bounds = {}
+        for _, _row in df.iterrows():
+            if int(_row.get('lock_spend', 0)) == 1:
+                continue
+            _ch = _row['channel']
+            _lo_key = f"lo_{_ch}"
+            _hi_key = f"hi_{_ch}"
+            _lo_default = float(_row.get('lower_bound_pct', 0.5))
+            _hi_default = float(_row.get('upper_bound_pct', 1.5))
+            # Use session_state value if widget has been rendered before,
+            # otherwise fall back to the value from the input data.
+            _lo_val = st.session_state.get(_lo_key, _lo_default * 100) / 100.0
+            _hi_val = st.session_state.get(_hi_key, _hi_default * 100) / 100.0
+            override_bounds[_ch] = (_lo_val, _hi_val)
 
         if budget_mode == "Keep total budget":
             opt_budget = _baseline_total
             st.markdown(f"<div class='alert-box alert-info'>Total budget: "
                         f"<b>{fmt(opt_budget, '$')}</b></div>", unsafe_allow_html=True)
+            
+            # ── Face-to-Face unlock option for Keep total budget ─────────────
+            if _has_f2f:
+                _f2f_spend = float(df[df['channel'] == _f2f_channel]['total_spend'].iloc[0])
+                st.markdown(
+                    f"<div style='font-size:.7rem;margin-top:.5rem;color:{PALETTE['muted']}'>"
+                    f"Channel Unlock Options</div>",
+                    unsafe_allow_html=True
+                )
+                _unlock_f2f_ktb = st.checkbox(
+                    f"🔓 Unlock {_f2f_channel} for reallocation",
+                    value=False,
+                    key="ktb_unlock_f2f",
+                    help=(
+                        f"Unlock {_f2f_channel} channel to allow the optimizer to "
+                        f"redistribute its budget of {fmt(_f2f_spend,'$')} across other channels."
+                    )
+                )
+                if _unlock_f2f_ktb:
+                    # Apply unlock to df_scan
+                    mask = df_scan['channel'] == _f2f_channel
+                    df_scan.loc[mask, 'lock_spend'] = 0
+                    df_scan.loc[mask, 'lower_bound_pct'] = 0.5
+                    df_scan.loc[mask, 'upper_bound_pct'] = 3.0
+                    st.markdown(
+                        f"<div class='alert-box alert-info' style='font-size:.75rem'>"
+                        f"✅ {_f2f_channel} unlocked · will be included in optimization</div>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                _unlock_f2f_ktb = False
 
         elif budget_mode == "Model recommends budget":
 
@@ -2310,19 +2820,39 @@ with tab_opt:
                 f"Scan Range</div>",
                 unsafe_allow_html=True
             )
+
+            # Show which objective the scan will use
+            _mrb_obj_preview = obj_map.get(opt_objective, "profit")
+            _mrb_obj_color = PALETTE["accent2"] if _mrb_obj_preview == "profit" else PALETTE["accent"]
+            _mrb_obj_icon  = "💰" if _mrb_obj_preview == "profit" else "📈"
+            st.markdown(
+                f"<div class='alert-box alert-info' style='font-size:.75rem;margin-bottom:.4rem'>"
+                f"{_mrb_obj_icon} Scan will <b>maximise {_mrb_obj_preview.upper()}</b> "
+                f"at each budget level (matches your Objective setting above). "
+                f"Per-channel bounds are strictly enforced during the scan.</div>",
+                unsafe_allow_html=True
+            )
             _sr_col1, _sr_col2 = st.columns(2)
+
             with _sr_col1:
                 _scan_lo_pct = st.number_input(
                     "Min budget (% of baseline)",
-                    value=70, min_value=10, max_value=200, step=5,
+                    value=70,
+                    min_value=10,
+                    max_value=200,
+                    step=5,
                     key="mrb_lo_pct",
                     help=f"Scan starts at this % of baseline {fmt(_baseline_total,'$')}. "
                          f"Default 70% = {fmt(_baseline_total*0.7,'$')}"
                 ) / 100.0
+
             with _sr_col2:
                 _scan_hi_pct = st.number_input(
                     "Max budget (% of baseline)",
-                    value=150, min_value=50, max_value=500, step=10,
+                    value=150,
+                    min_value=50,
+                    max_value=500,
+                    step=10,
                     key="mrb_hi_pct",
                     help=f"Scan ends at this % of baseline {fmt(_baseline_total,'$')}. "
                          f"Default 150% = {fmt(_baseline_total*1.5,'$')}"
@@ -2336,25 +2866,36 @@ with tab_opt:
                 "$5M steps":   5_000_000,
                 "$10M steps": 10_000_000,
             }
+
             _scan_incr_label = st.selectbox(
                 "Budget increment",
                 list(_incr_options.keys()),
-                index=3,   # default $5M
+                index=3,
                 key="mrb_increment",
                 help="Each scan point is this many dollars apart. "
                      "Smaller = more scan points = slower but more precise."
             )
+
             _scan_increment = _incr_options[_scan_incr_label]
 
-            # Preview: show exact scan points that will be run
-            _scan_lo_abs  = max(
+            # ── Preview scan points ──────────────────────────────────────────
+            _scan_lo_abs = max(
                 round(_baseline_total * _scan_lo_pct / _scan_increment) * _scan_increment,
                 _scan_increment
             )
-            _scan_hi_abs  = round(_baseline_total * _scan_hi_pct / _scan_increment) * _scan_increment
-            _scan_pts_arr = np.arange(_scan_lo_abs, _scan_hi_abs + _scan_increment * 0.5, _scan_increment)
-            _n_pts        = len(_scan_pts_arr)
-            _est_secs     = _n_pts * 2   # ~2s per GEKKO solve
+
+            _scan_hi_abs = round(
+                _baseline_total * _scan_hi_pct / _scan_increment
+            ) * _scan_increment
+
+            _scan_pts_arr = np.arange(
+                _scan_lo_abs,
+                _scan_hi_abs + _scan_increment * 0.5,
+                _scan_increment
+            )
+
+            _n_pts = len(_scan_pts_arr)
+            _est_secs = _n_pts * 2
 
             st.markdown(
                 f"<div class='alert-box alert-info' style='font-size:.76rem'>"
@@ -2366,7 +2907,10 @@ with tab_opt:
             )
 
             # ── Lock override toggle ─────────────────────────────────────────
-            _locked_channels = df[df['lock_spend'].astype(int) == 1]['channel'].tolist()
+            _locked_channels = df[
+                df['lock_spend'].astype(int) == 1
+            ]['channel'].tolist()
+
             _has_locks = len(_locked_channels) > 0
 
             if _has_locks:
@@ -2374,220 +2918,576 @@ with tab_opt:
                     f"<div class='alert-box alert-warn' style='font-size:.76rem;margin-top:.4rem'>"
                     f"⚠️ <b>{', '.join(_locked_channels)}</b> "
                     f"{'is' if len(_locked_channels)==1 else 'are'} locked "
-                    f"({fmt(_locked_spend_min,'$')}). Unlock to allow full reallocation. If locked channel bounds does not apply</div>",
+                    f"({fmt(_locked_spend_min,'$')}). "
+                    f"Unlock to allow full reallocation.</div>",
                     unsafe_allow_html=True
                 )
+
                 _unlock_for_scan = st.checkbox(
                     f"🔓 Unlock {', '.join(_locked_channels)} for this scan",
                     value=True,
                     key="mrb_unlock_locked",
-                    help=(
-                        "Freed for this mode only — lock is NOT permanently changed in your data."
-                    )
+                    help="Freed for this mode only — lock is NOT permanently changed."
                 )
             else:
                 _unlock_for_scan = False
 
-            # Build the df used for scanning — optionally unlock locked channels
+            # ── Build scan dataframe ─────────────────────────────────────────
             df_scan = df.copy()
+
             if _has_locks and _unlock_for_scan:
                 df_scan['lock_spend'] = 0
+
                 for ch in _locked_channels:
                     mask = df_scan['channel'] == ch
                     df_scan.loc[mask, 'lower_bound_pct'] = 0.5
                     df_scan.loc[mask, 'upper_bound_pct'] = 3.0
 
-            # Run the frontier scan on button click
-            scan_key = (f"optimal_budget_scan|{use_hill_global}|{use_log_global}|"
-                        f"{_unlock_for_scan}|{_scan_lo_pct:.2f}|{_scan_hi_pct:.2f}|{_scan_increment:.0f}")
-            # Store current scan key so opt_results column can look up the right result
-            st.session_state["_mrb_scan_key"] = scan_key
-            if st.button("🔍 Find Optimal Budget", key="find_opt_bgt_btn",
-                         width="stretch"):
-                _spinner_msg = (f"Scanning {_n_pts} budget levels "
-                                f"({fmt(_scan_lo_abs,'$')} → {fmt(_scan_hi_abs,'$')} "
-                                f"every {fmt(_scan_increment,'$')})…")
-                with st.spinner(_spinner_msg):
-                    scan_result = find_optimal_budget(
-                        df_scan, use_hill=use_hill_global, use_log=use_log_global,
-                        lo_pct=_scan_lo_pct, hi_pct=_scan_hi_pct,
-                        increment=_scan_increment
-                    )
-                st.session_state[scan_key] = scan_result
+            # ── Face-to-Face unlock option ──────────────────────────────────
+            if _has_f2f and _f2f_channel not in _locked_channels:
 
-            scan_result = st.session_state.get(scan_key)
-            if scan_result and scan_result["success"]:
-                opt_budget = scan_result["optimal_budget"]
-                _lock_note = " · all channels unlocked" if (_has_locks and _unlock_for_scan) else ""
+                _f2f_spend = float(
+                    df[df['channel'] == _f2f_channel]['total_spend'].iloc[0]
+                )
+
+                _f2f_locked = int(
+                    df[df['channel'] == _f2f_channel]['lock_spend'].iloc[0]
+                ) == 1
+
                 st.markdown(
-                    f"<div class='alert-box alert-success' style='font-size:.78rem'>"
-                    f"✅ <b>{fmt(opt_budget,'$')}</b> recommended "
-                    f"({(opt_budget/_baseline_total-1)*100:+.1f}% vs baseline){_lock_note}</div>",
+                    f"<div style='font-size:.7rem;margin-top:.5rem;"
+                    f"color:{PALETTE['muted']}'>"
+                    f"Additional Channel Options</div>",
                     unsafe_allow_html=True
                 )
+
+                _unlock_f2f_mrb = st.checkbox(
+                    f"🔓 Unlock {_f2f_channel} for this scan",
+                    value=not _f2f_locked,
+                    key="mrb_unlock_f2f",
+                    help=(
+                        f"Unlock {_f2f_channel} "
+                        f"(current spend: {fmt(_f2f_spend,'$')}) "
+                        f"to allow reallocation during scan."
+                    )
+                )
+
+                if _unlock_f2f_mrb:
+                    mask = df_scan['channel'] == _f2f_channel
+                    df_scan.loc[mask, 'lock_spend'] = 0
+                    df_scan.loc[mask, 'lower_bound_pct'] = 0.5
+                    df_scan.loc[mask, 'upper_bound_pct'] = 3.0
+
+                    st.markdown(
+                        f"<div class='alert-box alert-info' style='font-size:.75rem'>"
+                        f"✅ {_f2f_channel} unlocked for scan</div>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                _unlock_f2f_mrb = False
+
+            # ── Scan key ─────────────────────────────────────────────────────
+            _mrb_obj_label = obj_map[opt_objective]  # "profit" or "revenue"
+            scan_key = (
+                f"optimal_budget_scan|{use_hill_global}|{use_log_global}|"
+                f"{_unlock_for_scan}|{_scan_lo_pct:.2f}|"
+                f"{_scan_hi_pct:.2f}|{_scan_increment:.0f}|{_mrb_obj_label}"
+            )
+
+            st.session_state["_mrb_scan_key"] = scan_key
+
+            # ── Run frontier scan ────────────────────────────────────────────
+            if st.button(
+                "🔍 Find Optimal Budget",
+                key="find_opt_bgt_btn",
+                width="stretch"
+            ):
+
+                _spinner_msg = (
+                    f"Scanning {_n_pts} budget levels "
+                    f"({fmt(_scan_lo_abs,'$')} → {fmt(_scan_hi_abs,'$')} "
+                    f"every {fmt(_scan_increment,'$')})…"
+                )
+
+                with st.spinner(_spinner_msg):
+
+                    scan_result = find_optimal_budget(
+                        df_scan,
+                        use_hill=use_hill_global,
+                        use_log=use_log_global,
+                        lo_pct=_scan_lo_pct,
+                        hi_pct=_scan_hi_pct,
+                        increment=_scan_increment,
+                        respect_bounds=True,
+                        strict_feasible=True,
+                        objective=_mrb_obj_label
+                    )
+
+                st.session_state[scan_key] = scan_result
+
+            # ── Read scan result ─────────────────────────────────────────────
+            scan_result = st.session_state.get(scan_key)
+
+            if scan_result and scan_result.get("success"):
+
+                # Infeasible budgets excluded
+                if scan_result.get("infeasible_points", 0) > 0:
+
+                    st.markdown(
+                        f"<div class='alert-box alert-warn' "
+                        f"style='font-size:.76rem'>"
+                        f"⚠️ <b>{scan_result['infeasible_points']} "
+                        f"budget level(s)</b> were skipped because channel "
+                        f"constraints could not be satisfied."
+                        f"<br>This often happens when Face-to-Face is locked "
+                        f"or some channels hit max bounds."
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                opt_budget = scan_result["optimal_budget"]
+
+                # ── Detect scan ceiling hit (revenue-max always hits top of range) ──
+                _scan_hi_abs_val = _baseline_total * _scan_hi_pct
+                _at_ceiling = abs(opt_budget - _scan_hi_abs_val) < _scan_increment * 0.6
+                if _at_ceiling and _mrb_obj_label == "revenue":
+                    st.markdown(
+                        f"<div class='alert-box alert-warn' style='font-size:.76rem'>"
+                        f"📈 <b>Revenue-max hit the scan ceiling ({fmt(opt_budget,'$')}).</b>"
+                        f"<br>For a power/log response curve, revenue is always increasing, "
+                        f"so the revenue-optimal budget is the highest budget scanned. "
+                        f"Consider increasing the <b>Max budget %</b> input above to explore "
+                        f"larger budgets, or accept the current ceiling as a practical cap."
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                # Detect if recommended budget still needs warning
+                _constraint_warning = scan_result.get(
+                    "constraint_warning",
+                    False
+                )
+
+                if _constraint_warning:
+
+                    st.markdown(
+                        f"<div class='alert-box alert-warn' "
+                        f"style='font-size:.78rem'>"
+                        f"⚠️ <b>Recommended budget "
+                        f"{fmt(opt_budget,'$')}</b> may exceed one or more "
+                        f"channel bounds due to locked channels."
+                        f"<br>Please confirm before viewing optimized results."
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    _accept_warning = st.checkbox(
+                        "✅ I understand — show optimized table anyway",
+                        key="mrb_accept_warning"
+                    )
+
+                    if _accept_warning:
+
+                        st.markdown(
+                            f"<div class='alert-box alert-success' "
+                            f"style='font-size:.78rem'>"
+                            f"✅ <b>{fmt(opt_budget,'$')}</b> recommended "
+                            f"({(opt_budget/_baseline_total-1)*100:+.1f}% "
+                            f"vs baseline)</div>",
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        opt_budget = _baseline_total
+
+                else:
+
+                    _lock_note = (
+                        " · all channels unlocked"
+                        if (_has_locks and _unlock_for_scan)
+                        else ""
+                    )
+
+                    st.markdown(
+                        f"<div class='alert-box alert-success' "
+                        f"style='font-size:.78rem'>"
+                        f"✅ <b>{fmt(opt_budget,'$')}</b> recommended "
+                        f"({(opt_budget/_baseline_total-1)*100:+.1f}% "
+                        f"vs baseline){_lock_note}</div>",
+                        unsafe_allow_html=True
+                    )
+
             else:
                 opt_budget = _baseline_total
 
         else:  # Set new budget
+            df_scan = df.copy()
+
             opt_budget = st.number_input(
                 "Total budget ($)",
                 value=_baseline_total,
                 min_value=_locked_spend_min if _locked_spend_min > 0 else 1.0,
-                step=10000.0, format="%.0f"
+                step=50000.0,
+                format="%.0f"
             )
+
             delta_b = opt_budget - _baseline_total
-            if _locked_spend_min > 0 and opt_budget <= _locked_spend_min:
+            _budget_warning = False
+
+            # ── Face-to-Face unlock option for Set new budget ────────────────
+            if _has_f2f:
+                _f2f_spend = float(
+                    df[df['channel'] == _f2f_channel]['total_spend'].iloc[0]
+                )
+
+                _f2f_locked = int(
+                    df[df['channel'] == _f2f_channel]['lock_spend'].iloc[0]
+                ) == 1
+
                 st.markdown(
-                    f"<div class='alert-box alert-warn'>⚠️ Budget {fmt(opt_budget,'$')} is at or "
-                    f"below locked spend ({fmt(_locked_spend_min,'$')}). "
-                    f"No budget remains for flexible channels — increase above "
-                    f"{fmt(_locked_spend_min,'$')}.</div>",
+                    f"<div style='font-size:.7rem;margin-top:.5rem;"
+                    f"color:{PALETTE['muted']}'>"
+                    f"Channel Unlock Options</div>",
                     unsafe_allow_html=True
                 )
+
+                _unlock_f2f_snb = st.checkbox(
+                    f"🔓 Unlock {_f2f_channel} for reallocation",
+                    value=not _f2f_locked,
+                    key="snb_unlock_f2f",
+                    help=(
+                        f"Unlock {_f2f_channel} channel "
+                        f"(current spend: {fmt(_f2f_spend,'$')}) "
+                        f"to allow optimizer redistribution."
+                    )
+                )
+
+                if _unlock_f2f_snb:
+                    mask = df_scan['channel'] == _f2f_channel
+                    df_scan.loc[mask, 'lock_spend'] = 0
+                    df_scan.loc[mask, 'lower_bound_pct'] = 0.5
+                    df_scan.loc[mask, 'upper_bound_pct'] = 3.0
+
+                    st.markdown(
+                        f"<div class='alert-box alert-info' "
+                        f"style='font-size:.75rem'>"
+                        f"✅ {_f2f_channel} unlocked · included in optimization"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                _unlock_f2f_snb = False
+
+            # ── Standard budget message ──────────────────────────────────────
+            if _locked_spend_min > 0 and opt_budget <= _locked_spend_min:
+                st.markdown(
+                    f"<div class='alert-box alert-warn'>"
+                    f"⚠️ Budget {fmt(opt_budget,'$')} is at or below "
+                    f"locked spend ({fmt(_locked_spend_min,'$')}). "
+                    f"No budget remains for flexible channels."
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                _budget_warning = True
+
             else:
                 _flex_remain = opt_budget - _locked_spend_min
                 cls_ = "alert-success" if delta_b >= 0 else "alert-warn"
+
                 st.markdown(
-                    f"<div class='alert-box {cls_}'>Delta vs baseline: "
+                    f"<div class='alert-box {cls_}'>"
+                    f"Delta vs baseline: "
                     f"<b>{fmt(delta_b,'$','+' if delta_b>=0 else '')}</b>"
-                    + (f" &nbsp;·&nbsp; Flexible budget: <b>{fmt(_flex_remain,'$')}</b>"
-                       if _locked_spend_min > 0 else "")
+                    + (
+                        f" &nbsp;·&nbsp; Flexible budget: "
+                        f"<b>{fmt(_flex_remain,'$')}</b>"
+                        if _locked_spend_min > 0 else ""
+                    )
                     + "</div>",
                     unsafe_allow_html=True
+                )
+
+            # ── HIGH BUDGET IMPRACTICALITY WARNING ───────────────────────────
+            _budget_ratio = opt_budget / _baseline_total if _baseline_total > 0 else 1.0
+            if _budget_ratio >= 2.5:
+                st.markdown(
+                    f"<div class='alert-box alert-warn' style='font-size:.78rem'>"
+                    f"🚨 <b>Very high budget: {(_budget_ratio-1)*100:.0f}% above baseline.</b>"
+                    f"<br>Budgets above 250% of baseline are typically impractical in pharma "
+                    f"commercial planning. Channels will be deeply in diminishing-returns territory "
+                    f"and mROI will be very low. Consider whether this scenario is actionable."
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+            elif _budget_ratio >= 1.75:
+                st.markdown(
+                    f"<div class='alert-box alert-warn' style='font-size:.78rem'>"
+                    f"⚠️ <b>High budget: {(_budget_ratio-1)*100:.0f}% above baseline.</b>"
+                    f"<br>This is a stretch scenario. At this level, most channels will show "
+                    f"significant diminishing returns (mROI well below 1). "
+                    f"Ensure this budget level is operationally feasible."
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            # ── HARD FEASIBILITY CHECK (RESPECT LOCKS + OVERRIDE BOUNDS) ─────
+            # Build effective bounds: start from df_scan (which has unlock applied),
+            # then layer on any per-channel overrides the user set in the expander.
+            _mins = []
+            _maxs = []
+
+            for _, r in df_scan.iterrows():
+                b      = float(r["total_spend"])
+                locked = int(r.get("lock_spend", 0)) == 1
+                ch     = r["channel"]
+
+                if locked:
+                    _mins.append(b)
+                    _maxs.append(b)
+                else:
+                    # Use override if user set it, otherwise use df_scan bound
+                    if ch in override_bounds:
+                        lo_eff, hi_eff = override_bounds[ch]
+                    else:
+                        lo_eff = float(r["lower_bound_pct"])
+                        hi_eff = float(r["upper_bound_pct"])
+                    _mins.append(b * lo_eff)
+                    _maxs.append(b * hi_eff)
+
+            _min_total = float(sum(_mins))
+            _max_total = float(sum(_maxs))
+
+            if opt_budget < _min_total:
+                _budget_warning = True
+
+                st.markdown(
+                    f"<div class='alert-box alert-warn' "
+                    f"style='font-size:.78rem'>"
+                    f"⚠️ <b>Budget too LOW for current channel constraints.</b>"
+                    f"<br>Entered: <b>{fmt(opt_budget,'$')}</b>"
+                    f"<br>Minimum feasible: <b>{fmt(_min_total,'$')}</b>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            elif opt_budget > _max_total:
+                _budget_warning = True
+                _needed_ratio_ctrl = (opt_budget - float(
+                    (df_scan[df_scan['lock_spend'].astype(int)==1]['total_spend']).sum()
+                )) / max(float(
+                    (df_scan[df_scan['lock_spend'].astype(int)==0]['total_spend']).sum()
+                ), 1.0)
+
+                if _has_f2f and not _unlock_f2f_snb:
+                    _warn_msg = (
+                        f"⚠️ <b>Budget exceeds feasible maximum.</b>"
+                        f"<br>Entered: <b>{fmt(opt_budget,'$')}</b>"
+                        f"<br>Maximum feasible with locked {_f2f_channel}: "
+                        f"<b>{fmt(_max_total,'$')}</b>"
+                        f"<br><br>Unlock {_f2f_channel} or lower budget."
+                    )
+                else:
+                    _warn_msg = (
+                        f"⚠️ <b>Budget exceeds channel max bounds.</b>"
+                        f"<br>Entered: <b>{fmt(opt_budget,'$')}</b>"
+                        f"<br>Maximum feasible: <b>{fmt(_max_total,'$')}</b>"
+                        f"<br>Tip: increase channel Max% bounds below."
+                    )
+
+                st.markdown(
+                    f"<div class='alert-box alert-warn' "
+                    f"style='font-size:.78rem'>{_warn_msg}</div>",
+                    unsafe_allow_html=True
+                )
+
+                # Show per-channel guidance on what Max% to set
+                _ctrl_flex = df_scan[df_scan['lock_spend'].astype(int) == 0]
+                _ctrl_guide = []
+                for _, _cgr in _ctrl_flex.iterrows():
+                    _cg_base   = float(_cgr['total_spend'])
+                    _cg_cur_hi = override_bounds.get(_cgr['channel'], (None, float(_cgr.get('upper_bound_pct',1.5))))[1]
+                    _cg_cur_max = _cg_base * _cg_cur_hi
+                    _cg_needed  = _needed_ratio_ctrl * 1.05
+                    if _cg_needed > _cg_cur_hi:
+                        _ctrl_guide.append({
+                            "Channel":      _cgr['channel'],
+                            "Current Max%": f"{_cg_cur_hi*100:.0f}%",
+                            "Current Max $": fmt(_cg_cur_max, "$"),
+                            "Suggested Max%": f"{_cg_needed*100:.0f}%",
+                            "Suggested Max $": fmt(_cg_base * _cg_needed, "$"),
+                        })
+                if _ctrl_guide:
+                    st.markdown(
+                        f"<div style='font-size:.72rem;font-weight:600;"
+                        f"margin:.4rem 0 .2rem'>💡 Suggested Max% increases:</div>",
+                        unsafe_allow_html=True
+                    )
+                    st.dataframe(pd.DataFrame(_ctrl_guide), hide_index=True,
+                                 use_container_width=True)
+
+            elif not _budget_warning:
+                st.markdown(
+                    f"<div class='alert-box alert-success' "
+                    f"style='font-size:.76rem'>"
+                    f"✅ Budget is feasible within all channel constraints."
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            # ── CONSTRAINT SUMMARY for Set new budget ────────────────────────
+            with st.expander("📐 Channel constraint summary for this budget", expanded=False):
+                _snb_rows = []
+                for _, _r in df_scan.iterrows():
+                    _b      = float(_r["total_spend"])
+                    _locked = int(_r.get("lock_spend", 0)) == 1
+                    _ch     = _r["channel"]
+                    if _locked:
+                        _snb_rows.append({
+                            "Channel": _ch,
+                            "Status": "🔒 Locked",
+                            "Min ($)": fmt(_b, "$"),
+                            "Max ($)": fmt(_b, "$"),
+                            "Feasible?": "🔒",
+                            "Share of Baseline": f"{_b/_baseline_total*100:.1f}%",
+                        })
+                    else:
+                        # Use effective bound (override takes precedence)
+                        if _ch in override_bounds:
+                            _lo_pct_eff, _hi_pct_eff = override_bounds[_ch]
+                        else:
+                            _lo_pct_eff = float(_r["lower_bound_pct"])
+                            _hi_pct_eff = float(_r["upper_bound_pct"])
+                        _lo_amt = _b * _lo_pct_eff
+                        _hi_amt = _b * _hi_pct_eff
+                        _ch_feasible = (_lo_amt <= opt_budget) and (opt_budget <= _max_total)
+                        _snb_rows.append({
+                            "Channel": _ch,
+                            "Status": "🔓 Flexible",
+                            "Min ($)": fmt(_lo_amt, "$"),
+                            "Max ($)": fmt(_hi_amt, "$"),
+                            "Feasible?": "✓" if _ch_feasible else "⚠️",
+                            "Share of Baseline": f"{_b/_baseline_total*100:.1f}%",
+                        })
+                st.dataframe(pd.DataFrame(_snb_rows), hide_index=True, width="stretch")
+                _muted_color = PALETTE["muted"]
+                st.markdown(
+                    f"<div style='font-size:.72rem;color:{_muted_color};margin-top:.3rem'>"
+                    f"Total feasible range: <b>{fmt(_min_total,'$')}</b> – <b>{fmt(_max_total,'$')}</b> "
+                    f"&nbsp;·&nbsp; Your budget: <b>{fmt(opt_budget,'$')}</b>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            # ── Confirmation required if warning exists ──────────────────────
+            if _budget_warning:
+                _accept_budget_warning = st.checkbox(
+                    "✅ I understand — run optimization anyway",
+                    key="snb_accept_warning"
                 )
 
         st.markdown(f"<div style='height:.5rem'></div>", unsafe_allow_html=True)
         _muted = PALETTE["muted"]
 
         # ── How allocation works explanation ─────────────────────────────────
-        st.markdown(f"""
-        <div style='background:{PALETTE["surface2"]};border:1px solid {PALETTE["border"]};
-                    border-radius:10px;padding:.65rem .85rem;font-size:.76rem;
-                    color:{PALETTE["text2"]};margin-bottom:.5rem'>
-            <b>How budget allocation works:</b><br>
-            The optimizer automatically distributes the total budget across channels
-            to maximise your objective — no manual allocation needed.<br><br>
-            <b>Bounds (optional guard-rails):</b> Min% and Max% limit how far
-            each channel's spend can move from its baseline.
-            For example, Min=50% means the channel gets at least half its current spend;
-            Max=150% means it can get at most 1.5× its current spend.<br><br>
-            <span style='color:{PALETTE["accent2"]}'>
-            ✅ Leave defaults unless you have a business reason to constrain a channel.</span>
-        </div>
-        """, unsafe_allow_html=True)
+        _alloc_bg    = PALETTE["surface2"]
+        _alloc_bdr   = PALETTE["border"]
+        _alloc_txt   = PALETTE["text2"]
+        _alloc_green = PALETTE["accent2"]
+        st.markdown(
+            f"<div style='background:{_alloc_bg};border:1px solid {_alloc_bdr};"
+            f"border-radius:10px;padding:.65rem .85rem;font-size:.76rem;"
+            f"color:{_alloc_txt};margin-bottom:.5rem'>"
+            f"<b>How budget allocation works:</b><br>"
+            f"The optimizer automatically distributes the total budget across channels "
+            f"to maximise your objective — no manual allocation needed.<br><br>"
+            f"<b>Bounds (optional guard-rails):</b> Min% and Max% limit how far "
+            f"each channel's spend can move from its baseline.<br><br>"
+            f"<span style='color:{_alloc_green}'>✅ Constraints are now strictly enforced.</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
-        st.markdown(f"<div style='font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:{_muted};padding:.4rem 0'>Channel Bounds (optional guard-rails)</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:.72rem;font-weight:700;"
+            f"text-transform:uppercase;letter-spacing:.06em;"
+            f"color:{_muted};padding:.4rem 0'>"
+            f"Channel Bounds (optional guard-rails)</div>",
+            unsafe_allow_html=True
+        )
 
-        # Budget ratio for showing scaled $ amounts
-        _budget_ratio = opt_budget / _baseline_total if _baseline_total > 0 else 1.0
-
-        override_bounds = {}
         with st.expander("Per-channel bounds", expanded=False):
-            if budget_mode == "Set new budget":
-                st.caption(
-                    f"Bounds are % of each channel's **baseline spend**. "
-                    f"You do NOT need to change these — the optimizer automatically "
-                    f"distributes the new budget ({fmt(opt_budget,'$')}, "
-                    f"{_budget_ratio*100:.0f}% of baseline) proportionally within these limits. "
-                    f"Only adjust if you want to force a specific channel higher or lower."
-                )
-            else:
-                if budget_mode == "Model recommends budget" and abs(_budget_ratio - 1.0) > 0.05:
-                    st.caption(
-                        f"Bounds are % of each channel's **baseline spend**. "
-                        f"Since the selected budget ({fmt(opt_budget,'$')}) is "
-                        f"**{_budget_ratio*100:.0f}%** of baseline, upper bounds are "
-                        f"automatically scaled to at least {_budget_ratio*120:.0f}% "
-                        f"so the optimizer can absorb the full budget. "
-                        f"You can tighten individual channels below."
-                    )
-                else:
-                    st.caption(
-                        "Bounds are % of each channel's **baseline spend**. "
-                        "The optimizer freely allocates within these limits."
-                    )
 
             for _, row in df.iterrows():
+
                 if int(row.get('lock_spend', 0)) == 1:
                     st.markdown(
-                        f"<div style='display:flex;align-items:center;gap:.5rem;"
-                        f"padding:.3rem 0;font-size:.8rem'>"
-                        f"<span class='chip chip-gold'>🔒 {row['channel']} — locked at "
+                        f"<div style='display:flex;align-items:center;"
+                        f"gap:.5rem;padding:.3rem 0;font-size:.8rem'>"
+                        f"<span class='chip chip-gold'>"
+                        f"🔒 {row['channel']} — locked at "
                         f"{fmt(float(row['total_spend']),'$')}</span></div>",
                         unsafe_allow_html=True
                     )
                     continue
 
-                base    = float(row['total_spend'])
-                lo_pct  = float(row.get('lower_bound_pct', 0.5)) * 100
-                hi_pct  = float(row.get('upper_bound_pct', 1.5)) * 100
-                ch_desc = ch_desc_map.get(row['channel'], row['channel'])
+                base = float(row['total_spend'])
+                lo_pct = float(row.get('lower_bound_pct', 0.5)) * 100
+                hi_pct = float(row.get('upper_bound_pct', 1.5)) * 100
 
-                # Effective range at the new budget
-                eff_lo = base * lo_pct / 100 * _budget_ratio
-                eff_hi = base * hi_pct / 100 * _budget_ratio
+                c0, c1, c2, c3 = st.columns([.16, .28, .28, .16])
 
-                _at_new = (f" · at new budget: ~{fmt(base*_budget_ratio,'$')}"
-                           if budget_mode == "Set new budget" and abs(_budget_ratio-1) > 0.01 else "")
-                st.markdown(
-                    f"<div style='font-size:.75rem;font-weight:600;color:{PALETTE['text2']}"
-                    f";margin-top:.4rem'>{row['channel']} "
-                    f"<span style='font-weight:400;color:{PALETTE['muted']}'>({ch_desc})"
-                    f" — baseline: {fmt(base,'$')}{_at_new}</span></div>",
-                    unsafe_allow_html=True
-                )
-                c1, c2, c3 = st.columns([.38, .38, .24])
+                c0.markdown(
+                f"<div style='font-size:.85rem;font-weight:400;"
+                f"padding-top:.35rem'>{row['channel']}</div>",
+                unsafe_allow_html=True
+                           )
+
+
                 lo_ov = c1.number_input(
-                    "Min%", value=lo_pct, min_value=0.0, max_value=100.0, step=5.0,
-                    key=f"lo_{row['channel']}",
-                    help=(f"Min {lo_pct:.0f}% of baseline {fmt(base,'$')} = {fmt(base*lo_pct/100,'$')}"
-                          + (f" (at new budget: ~{fmt(eff_lo,'$')})"
-                             if budget_mode == "Set new budget" else ""))
+                    "Min%",
+                    value=lo_pct,
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=5.0,
+                    key=f"lo_{row['channel']}"
                 )
+
                 hi_ov = c2.number_input(
-                    "Max%", value=hi_pct, min_value=0.0, max_value=500.0, step=5.0,
-                    key=f"hi_{row['channel']}",
-                    help=(f"Max {hi_pct:.0f}% of baseline {fmt(base,'$')} = {fmt(base*hi_pct/100,'$')}"
-                          + (f" (at new budget: ~{fmt(eff_hi,'$')})"
-                             if budget_mode == "Set new budget" else ""))
+                    "Max%",
+                    value=hi_pct,
+                    min_value=0.0,
+                    max_value=500.0,
+                    step=5.0,
+                    key=f"hi_{row['channel']}"
                 )
+
                 c3.markdown(
-                    f"<div style='font-size:.7rem;color:{PALETTE['muted']};padding-top:.45rem'>"
-                    f"Base: {fmt(base*lo_ov/100,'$')} – {fmt(base*hi_ov/100,'$')}</div>",
+                    f"<div style='font-size:.7rem;"
+                    f"color:{PALETTE['muted']};padding-top:.45rem'>"
+                    f"Base: {fmt(base*lo_ov/100,'$')} – "
+                    f"{fmt(base*hi_ov/100,'$')}</div>",
                     unsafe_allow_html=True
                 )
-                override_bounds[row['channel']] = (lo_ov / 100.0, hi_ov / 100.0)
+
+                override_bounds[row['channel']] = (
+                    lo_ov / 100.0,
+                    hi_ov / 100.0
+                )
 
         st.markdown(f"<div style='height:.5rem'></div>", unsafe_allow_html=True)
-        run_opt = st.button("🚀 Run Optimization", type="primary", width='stretch')
 
-        # Bounds signature for cache key — any bound change invalidates cache
-        _bounds_sig = "|".join(f"{ch}:{lo:.2f}:{hi:.2f}"
-                               for ch, (lo, hi) in sorted(override_bounds.items()))
+        run_opt = st.button(
+            "🚀 Run Optimization",
+            type="primary",
+            width='stretch'
+        )
 
-        # Quick compare: show all 3 objectives if they have been run
-        _all_keys = {
-            "Profit":  (f"profit|{method_map[opt_method]}|{opt_budget:.2f}|{budget_mode}|"
-                        f"{use_hill_global}|{use_log_global}|{_bounds_sig}"),
-            "Revenue": (f"revenue|{method_map[opt_method]}|{opt_budget:.2f}|{budget_mode}|"
-                        f"{use_hill_global}|{use_log_global}|{_bounds_sig}"),
-            "ROI":    (f"roas|{method_map[opt_method]}|{opt_budget:.2f}|{budget_mode}|"
-                        f"{use_hill_global}|{use_log_global}|{_bounds_sig}"),
-        }
-        _ran_keys = {k: v for k, v in _all_keys.items() if v in st.session_state}
-        if len(_ran_keys) > 1:
-            st.markdown(f"<div class='section-header' style='margin-top:.75rem'>Objective comparison</div>",
-                        unsafe_allow_html=True)
-            _cmp_rows = []
-            for _oname, _okey in _ran_keys.items():
-                _od = st.session_state[_okey]
-                _cmp_rows.append({
-                    "Objective":  _oname,
-                    "Rev ($)":    fmt(_od['opt_revenue'].sum(), "$"),
-                    "Profit ($)": fmt(_od['opt_profit'].sum(), "$"),
-                    "ROI":       f"{_od['opt_revenue'].sum()/max(_od['opt_spend'].sum(),EPS):.2f}×",
-                })
-            st.dataframe(pd.DataFrame(_cmp_rows), width='stretch', hide_index=True)
+        if _budget_warning and not _accept_budget_warning:
+            run_opt = False
+
+        _bounds_sig = "|".join(
+                    f"{ch}:{lo:.2f}:{hi:.2f}"
+                    for ch, (lo, hi) in sorted(override_bounds.items())
+                            )    
 
     with opt_results:
         # ── Frontier chart — shown at the top of results when model recommends budget ──
@@ -2601,6 +3501,23 @@ with tab_opt:
                 _rec_profit = _scan_res["optimal_profit"]
                 _base_pf    = float(df['baseline_profit'].sum())
                 _base_rev   = float(df['baseline_revenue'].sum())
+                # Determine which scan metric was used based on current objective
+                _mrb_is_revenue = (obj_map[opt_objective] == "revenue")
+                _mrb_scan_metric = "opt_revenue" if _mrb_is_revenue else "opt_profit"
+                _mrb_frontier_label = "Revenue ($)" if _mrb_is_revenue else "Profit ($)"
+
+                # ── Detect stale scan: objective changed since last scan ───────────
+                # The scan key encodes the objective at the END ("|profit" or "|revenue")
+                _stored_scan_key = st.session_state.get("_mrb_scan_key", "")
+                _scan_obj_in_key = _stored_scan_key.split("|")[-1] if _stored_scan_key else ""
+                _current_obj     = obj_map[opt_objective]
+                if _scan_obj_in_key and _scan_obj_in_key != _current_obj:
+                    st.warning(
+                        f"⚠️ The frontier was scanned with **{_scan_obj_in_key.upper()}** maximization "
+                        f"but you have now selected **{_current_obj.upper()}**. "
+                        f"Click **Find Optimal Budget** again to re-scan with the current objective.",
+                        icon="⚠️"
+                    )
 
                 # ── Build tiered budget options from the scan data ────────────────
                 # Tiers: Conservative (75% optimal), Moderate (90%), Optimal (100%),
@@ -2623,10 +3540,13 @@ with tab_opt:
                     _tbgt  = _rec_budget * _tfrac
                     _tbgt  = max(_tbgt, _baseline_total * 0.5)   # floor at 50% baseline
                     _trow  = _closest_scan_row(_tbgt)
-                    _trev  = float(_trow["opt_profit"]) + float(_trow.get("budget", _tbgt))
+                    # Use the correct revenue/profit columns from scan
                     _tpf   = float(_trow["opt_profit"])
+                    _trev  = float(_trow["opt_revenue"]) if "opt_revenue" in _trow else _tpf + float(_trow.get("budget", _tbgt))
                     _troi  = _trev / max(float(_trow.get("budget", _tbgt)), 1)
                     _incr_profit = _tpf - _base_pf
+                    _incr_rev    = _trev - _base_rev
+                    _incr_primary = _incr_rev if _mrb_is_revenue else _incr_profit
                     _incr_spend  = float(_trow.get("budget", _tbgt)) - _baseline_total
                     _tier_rows.append({
                         "label":        _tlabel,
@@ -2637,6 +3557,8 @@ with tab_opt:
                         "profit":       _tpf,
                         "roi":          _troi,
                         "incr_profit":  _incr_profit,
+                        "incr_revenue": _incr_rev,
+                        "incr_primary": _incr_primary,
                         "incr_spend":   _incr_spend,
                         "is_optimal":   _tfrac == 1.00,
                     })
@@ -2664,13 +3586,17 @@ with tab_opt:
                     _tr_rev   = _tr["revenue"]
                     _tr_pf    = _tr["profit"]
                     _tr_roi   = _tr["roi"]
-                    _tr_incr  = _tr["incr_profit"]
+                    _tr_incr  = _tr["incr_primary"]
                     _tr_opt   = _tr["is_optimal"]
                     _rec_note = "&nbsp;⭐ Recommended" if _tr_opt else ""
                     _pf_col   = _acc2 if _tr_pf >= _base_pf else _acc3
                     _ip_col   = _acc2 if _tr_incr >= 0 else _acc3
                     _ip_sign  = "+" if _tr_incr >= 0 else ""
                     _bgt_vs   = (_tr_bgt / _baseline_total - 1) * 100
+                    _delta_label = "Δ Revenue" if _mrb_is_revenue else "Δ Profit"
+                    _primary_val_label = "Revenue" if _mrb_is_revenue else "Profit"
+                    _primary_val = _tr_rev if _mrb_is_revenue else _tr_pf
+                    _primary_col = _acc2 if _primary_val >= (_base_rev if _mrb_is_revenue else _base_pf) else _acc3
                     with _tc:
                         st.markdown(
                             f"<div style='{_border_style};border-radius:12px;padding:.75rem .8rem;"
@@ -2682,13 +3608,13 @@ with tab_opt:
                             f"<div style='font-size:.62rem;color:{_mu2}'>{_bgt_vs:+.1f}% vs baseline</div>"
                             f"<hr style='margin:.4rem 0;border-color:{_bdr}'>"
                             f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:.2rem;font-size:.68rem'>"
-                            f"<div><div style='color:{_mu2}'>Revenue</div>"
-                            f"<div style='font-weight:600'>{fmt(_tr_rev,'$')}</div></div>"
-                            f"<div><div style='color:{_mu2}'>Profit</div>"
-                            f"<div style='font-weight:600;color:{_pf_col}'>{fmt(_tr_pf,'$')}</div></div>"
+                            f"<div><div style='color:{_mu2}'>{_primary_val_label}</div>"
+                            f"<div style='font-weight:600;color:{_primary_col}'>{fmt(_primary_val,'$')}</div></div>"
+                            f"<div><div style='color:{_mu2}'>{'Profit' if _mrb_is_revenue else 'Revenue'}</div>"
+                            f"<div style='font-weight:600'>{fmt(_tr_pf if _mrb_is_revenue else _tr_rev,'$')}</div></div>"
                             f"<div><div style='color:{_mu2}'>ROI</div>"
                             f"<div style='font-weight:600'>{_tr_roi:.2f}×</div></div>"
-                            f"<div><div style='color:{_mu2}'>Δ Profit</div>"
+                            f"<div><div style='color:{_mu2}'>{_delta_label}</div>"
                             f"<div style='font-weight:600;color:{_ip_col}'>{fmt(_tr_incr,'$',_ip_sign)}</div></div>"
                             f"</div></div>",
                             unsafe_allow_html=True
@@ -2697,6 +3623,7 @@ with tab_opt:
                 st.markdown(f"<div style='height:.75rem'></div>", unsafe_allow_html=True)
 
                 # ── Tiered comparison table ───────────────────────────────────────
+                _delta_col_name = "Δ Revenue" if _mrb_is_revenue else "Δ Profit"
                 _tier_table_rows = []
                 for _tr in _tier_rows:
                     _tier_table_rows.append({
@@ -2705,7 +3632,7 @@ with tab_opt:
                         "vs Baseline":   f"{(_tr['budget']/_baseline_total-1)*100:+.1f}%",
                         "Revenue":       fmt(_tr["revenue"], "$"),
                         "Profit":        fmt(_tr["profit"], "$"),
-                        "Δ Profit":      fmt(_tr["incr_profit"], "$", "+" if _tr["incr_profit"] >= 0 else ""),
+                        _delta_col_name: fmt(_tr["incr_primary"], "$", "+" if _tr["incr_primary"] >= 0 else ""),
                         "ROI":           f"{_tr['roi']:.2f}×",
                         "Extra Spend":   fmt(_tr["incr_spend"], "$", "+" if _tr["incr_spend"] >= 0 else ""),
                     })
@@ -2732,19 +3659,26 @@ with tab_opt:
 
                 # ── Frontier chart with all tiers marked ─────────────────────────
                 if PLOTLY and not _scan_df.empty:
+                    # Use the correct Y column depending on objective
+                    _frontier_y_col  = _mrb_scan_metric  # "opt_revenue" or "opt_profit"
+                    _frontier_y_vals = _scan_df[_frontier_y_col] if _frontier_y_col in _scan_df.columns else _scan_df["opt_profit"]
+                    _frontier_y_label = "Optimized Revenue ($)" if _mrb_is_revenue else "Optimized Profit ($)"
+                    _frontier_hover_label = "Revenue" if _mrb_is_revenue else "Profit"
+                    _tier_y_key = "revenue" if _mrb_is_revenue else "profit"
+
                     fig_scan = go.Figure()
                     fig_scan.add_trace(go.Scatter(
-                        x=_scan_df["budget"], y=_scan_df["opt_profit"],
+                        x=_scan_df["budget"], y=_frontier_y_vals,
                         fill='tozeroy',
                         fillcolor=f"rgba(5,122,85,0.07)",
                         line=dict(color=PALETTE["accent2"], width=0),
                         showlegend=False, hoverinfo='skip'
                     ))
                     fig_scan.add_trace(go.Scatter(
-                        x=_scan_df["budget"], y=_scan_df["opt_profit"],
+                        x=_scan_df["budget"], y=_frontier_y_vals,
                         mode='lines',
                         line=dict(color=PALETTE["accent2"], width=3, dash='dashdot'),
-                        hovertemplate="Budget: $%{x:,.0f}<br>Profit: $%{y:,.0f}<extra></extra>",
+                        hovertemplate=f"Budget: $%{{x:,.0f}}<br>{_frontier_hover_label}: $%{{y:,.0f}}<extra></extra>",
                         name="Efficient frontier"
                     ))
                     # Baseline
@@ -2759,8 +3693,9 @@ with tab_opt:
                     for _tr in _tier_rows:
                         _star = "star" if _tr["is_optimal"] else "circle"
                         _sz   = 16 if _tr["is_optimal"] else 11
+                        _tier_y_val = _tr[_tier_y_key]
                         fig_scan.add_trace(go.Scatter(
-                            x=[_tr["budget"]], y=[_tr["profit"]],
+                            x=[_tr["budget"]], y=[_tier_y_val],
                             mode='markers+text',
                             marker=dict(size=_sz, color=_tr["color"],
                                         symbol=_star, line=dict(color='white', width=2)),
@@ -2771,13 +3706,13 @@ with tab_opt:
                             hovertemplate=(
                                 f"<b>{_tr['label']}</b><br>"
                                 f"Budget: ${_tr['budget']:,.0f}<br>"
-                                f"Profit: ${_tr['profit']:,.0f}<br>"
+                                f"{_frontier_hover_label}: ${_tier_y_val:,.0f}<br>"
                                 f"ROI: {_tr['roi']:.2f}×<extra></extra>"
                             )
                         ))
                     fig_scan.update_layout(
                         title=dict(
-                            text="Efficient Frontier — 5 Budget Scenarios",
+                            text=f"Efficient Frontier — 5 Budget Scenarios ({_frontier_hover_label} Maximization)",
                             font=dict(size=12, color=PALETTE["text2"])
                         ),
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FAFBFC",
@@ -2789,36 +3724,41 @@ with tab_opt:
                         xaxis=dict(title="Total Budget ($)", tickformat="$,.0f",
                                    gridcolor="#EAECF0", linecolor=PALETTE["border2"],
                                    tickfont=dict(size=10, color=PALETTE["muted"])),
-                        yaxis=dict(title="Optimized Profit ($)", tickformat="$,.0f",
+                        yaxis=dict(title=_frontier_y_label, tickformat="$,.0f",
                                    gridcolor="#EAECF0", linecolor=PALETTE["border2"],
                                    tickfont=dict(size=10, color=PALETTE["muted"]))
                     )
                     st.plotly_chart(fig_scan, width='stretch')
+                    _frontier_note = (
+                        "The ⭐ Optimal point is the budget level where additional spend generates maximum revenue."
+                        if _mrb_is_revenue
+                        else "The ⭐ Optimal point is where mROI → 1 across all channels."
+                    )
                     st.markdown(
                         f"<div class='alert-box alert-info' style='font-size:.8rem'>"
                         f"💡 <b>How to read this:</b> Each marker is a selectable budget scenario. "
                         f"The curve rises steeply when channels are underinvested (high mROI) and "
-                        f"flattens as channels saturate. The ⭐ Optimal point is where mROI → 1 "
-                        f"across all channels. Select a tier above and click Run Optimization.</div>",
+                        f"flattens as channels saturate. {_frontier_note} "
+                        f"Select a tier above and click Run Optimization.</div>",
                         unsafe_allow_html=True
                     )
             else:
                 # No scan run yet — show placeholder
-                st.markdown(f"""
-                <div style='margin-top:2rem;text-align:center;padding:3rem;
-                            background:{PALETTE["surface"]};border-radius:16px;
-                            border:2px dashed {PALETTE["border"]}'>
-                    <div style='font-size:2rem;margin-bottom:1rem'>🔍</div>
-                    <div style='font-size:1rem;font-weight:600;color:{PALETTE["text"]};margin-bottom:.5rem'>
-                        Click "Find Optimal Budget" to scan the efficient frontier
-                    </div>
-                    <div style='font-size:.82rem;color:{PALETTE["muted"]}'>
-                        Set your scan range (Min/Max % of baseline) in the left panel,
-                        then click Find Optimal Budget. Default: 70%–150% of baseline
-                        for realistic planning scenarios.
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                _ph_surf = PALETTE["surface"]; _ph_bdr = PALETTE["border"]
+                _ph_txt  = PALETTE["text"];    _ph_mu  = PALETTE["muted"]
+                st.markdown(
+                    f"<div style='margin-top:2rem;text-align:center;padding:3rem;"
+                    f"background:{_ph_surf};border-radius:16px;border:2px dashed {_ph_bdr}'>"
+                    f"<div style='font-size:2rem;margin-bottom:1rem'>🔍</div>"
+                    f"<div style='font-size:1rem;font-weight:600;color:{_ph_txt};margin-bottom:.5rem'>"
+                    f"Click \"Find Optimal Budget\" to scan the efficient frontier</div>"
+                    f"<div style='font-size:.82rem;color:{_ph_mu}'>"
+                    f"Set your scan range (Min/Max % of baseline) in the left panel, "
+                    f"then click Find Optimal Budget. Default: 70%–150% of baseline "
+                    f"for realistic planning scenarios.</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
 
         # ── Cache key encodes ALL settings — any change produces a new key ─────
         _opt_key = (f"{obj_map[opt_objective]}|{method_map[opt_method]}|"
@@ -2827,7 +3767,7 @@ with tab_opt:
 
         # Only show results if Run was just clicked, OR we have a result for
         # exactly these settings. Never show stale results from different settings.
-        _has_cached = _opt_key in st.session_state and st.session_state[_opt_key] is not None
+        _has_cached = isinstance(st.session_state.get(_opt_key), pd.DataFrame)
 
         # In "Model recommends budget" mode, warn if scan hasn't run yet
         _mrb_key_check = st.session_state.get("_mrb_scan_key",
@@ -2843,65 +3783,184 @@ with tab_opt:
 
         if (run_opt and not _needs_scan) or _has_cached:
             if run_opt:
-                # Start from df_scan so lock overrides from the MRB toggle are respected.
-                # For other modes, df_scan == df (no change).
-                # Apply user bound overrides on top, then auto-scale upper bounds.
-                df_opt_in = df_scan.copy() if budget_mode == "Model recommends budget" else df.copy()
+                # Start from df_scan so lock overrides from any mode are respected.
+                df_opt_in = df_scan.copy()
 
-                # Auto-scale upper bounds so optimizer can absorb the selected budget.
-                # Required when budget >> baseline (e.g. +158% budget but bounds cap at 150%).
-                _locked_sp_total = float(
-                    (df_opt_in['total_spend'] * df_opt_in['lock_spend'].astype(int)).sum()
-                )
-                _flex_sp_total = float(df_opt_in['total_spend'].sum()) - _locked_sp_total
-                _flex_budget   = opt_budget - _locked_sp_total
-                _needed_ratio  = (_flex_budget / _flex_sp_total) if _flex_sp_total > 0 else 1.0
-
+                # ── Step 1: Apply user per-channel bound overrides ──────────────
                 for ch, (lo_ov, hi_ov) in override_bounds.items():
                     mask = df_opt_in['channel'] == ch
                     is_locked = int(df_opt_in.loc[mask, 'lock_spend'].iloc[0]) == 1
                     if is_locked:
                         continue
-                    _effective_hi = max(hi_ov, _needed_ratio * 1.20)
                     df_opt_in.loc[mask, 'lower_bound_pct'] = lo_ov
-                    df_opt_in.loc[mask, 'upper_bound_pct'] = _effective_hi
+                    df_opt_in.loc[mask, 'upper_bound_pct'] = hi_ov
 
-                _obj_label    = obj_map[opt_objective]
-                _method_label = method_map[opt_method]
-                with st.spinner(f"Optimizing · {opt_objective} · {opt_method} · Budget: {fmt(opt_budget, '$')}..."):
-                    result = optimize_budget(
-                        df_opt_in, opt_budget,
-                        objective=_obj_label,
-                        use_hill=use_hill_global,
-                        use_log=use_log_global,
-                        method=_method_label
+                # ── Step 2: Compute strict feasibility range ────────────────────
+                _locked_sp_total = float(
+                    (df_opt_in['total_spend'] * df_opt_in['lock_spend'].astype(int)).sum()
+                )
+                _flex_rows = df_opt_in[df_opt_in['lock_spend'].astype(int) == 0]
+                _flex_min  = float((_flex_rows['total_spend'] * _flex_rows['lower_bound_pct']).sum())
+                _flex_max  = float((_flex_rows['total_spend'] * _flex_rows['upper_bound_pct']).sum())
+                _strict_min = _locked_sp_total + _flex_min
+                _strict_max = _locked_sp_total + _flex_max
+                _flex_budget = opt_budget - _locked_sp_total
+                _flex_sp_total = float(_flex_rows['total_spend'].sum())
+
+                # ── Step 3: Feasibility gate (only for Set new budget) ──────────
+                _run_blocked = False
+
+                if budget_mode == "Set new budget" and opt_budget < _strict_min:
+                    st.error(
+                        f"⛔ Budget {fmt(opt_budget,'$')} is below the minimum required "
+                        f"by channel bounds ({fmt(_strict_min,'$')}). "
+                        f"Please raise the budget or lower channel Min% bounds.",
+                        icon="⛔"
                     )
+                    _run_blocked = True
 
-                spends_opt = result['spends']
-                df_opt = df_opt_in.copy()
-                df_opt['opt_spend']   = spends_opt
-                df_opt['opt_revenue'] = [revenue_from_spend(spends_opt[i], df_opt.iloc[i], use_hill_global, use_log_global)
-                                          for i in range(len(df_opt))]
-                df_opt['opt_profit']      = df_opt['opt_revenue'] - df_opt['opt_spend']
-                df_opt['opt_roi']        = df_opt['opt_revenue'] / df_opt['opt_spend'].replace(0, np.nan)
-                df_opt['delta_spend']     = df_opt['opt_spend']   - df_opt['total_spend']
-                df_opt['delta_profit']    = df_opt['opt_profit']   - df_opt['baseline_profit']
-                df_opt['delta_revenue']   = df_opt['opt_revenue']  - df_opt['baseline_revenue']
-                df_opt['delta_pct_spend'] = df_opt['delta_spend']  / df_opt['total_spend'].replace(0, np.nan) * 100
-                df_opt['opt_budget_used'] = opt_budget   # tag result with the budget that was used
+                elif budget_mode == "Set new budget" and opt_budget > _strict_max:
+                    # Calculate how much extra budget needs to be absorbed
+                    _excess         = opt_budget - _strict_max
+                    _needed_ratio   = (_flex_budget / _flex_sp_total) if _flex_sp_total > 0 else 1.0
 
-                # Store under this exact key (budget_mode included → no collision)
-                st.session_state[_opt_key]             = df_opt
-                st.session_state['opt_result_df']      = df_opt   # RC tab uses this
-                st.session_state['opt_success']        = result['success']
-                st.session_state['opt_message']        = result.get('message', '')
-                st.session_state['opt_objective_used'] = opt_objective
-                st.session_state['opt_method_used']    = opt_method
-                st.session_state['opt_budget_used']    = opt_budget
-                st.session_state['opt_budget_mode']    = budget_mode
+                    # Show per-channel guidance: what Max% each channel would need
+                    _guidance_rows = []
+                    for _, _gr in _flex_rows.iterrows():
+                        _g_base    = float(_gr['total_spend'])
+                        _g_cur_hi  = float(_gr.get('upper_bound_pct', 1.5))
+                        _g_cur_max = _g_base * _g_cur_hi
+                        _g_needed_hi = _needed_ratio * 1.05
+                        if _g_needed_hi > _g_cur_hi:
+                            _guidance_rows.append({
+                                "Channel":       _gr['channel'],
+                                "Current Max%":  f"{_g_cur_hi*100:.0f}%  (${_g_cur_max:,.0f})",
+                                "Needed Max%":   f"{_g_needed_hi*100:.0f}%  (${_g_base*_g_needed_hi:,.0f})",
+                            })
 
-            df_opt   = st.session_state[_opt_key]
-            success_ = st.session_state.get('opt_success', True)
+                    if _guidance_rows:
+                        _guide_df = pd.DataFrame(_guidance_rows)
+                        st.warning(
+                            f"⚠️ Budget {fmt(opt_budget,'$')} needs more room in channel Max% bounds. "
+                            f"Either increase Max% bounds below, or check "
+                            f"'I understand' to run anyway (optimizer will concentrate spend "
+                            f"in highest-ROI channels up to their current bounds).",
+                            icon="⚠️"
+                        )
+                        st.dataframe(_guide_df, hide_index=True, use_container_width=True)
+
+                    if _accept_budget_warning:
+                        # User accepted — run WITHOUT modifying bounds.
+                        # The optimizer will spend as much as bounds allow;
+                        # any unallocatable excess stays unspent (shown in gap warning).
+                        st.info(
+                            f"ℹ️ Running with current bounds. The optimizer will allocate "
+                            f"up to {fmt(_strict_max,'$')} (the channel bound maximum). "
+                            f"To spend the full {fmt(opt_budget,'$')}, increase Max% bounds "
+                            f"in the Per-channel bounds expander.",
+                            icon="ℹ️"
+                        )
+                        # Use _strict_max as effective budget so optimizer isn't overconstrained
+                        opt_budget = _strict_max
+                    else:
+                        _run_blocked = True
+
+                if not _run_blocked:
+                    _obj_label      = obj_map[opt_objective]
+                    _method_label   = method_map[opt_method]
+                    _display_budget = opt_budget   # may have been capped to _strict_max above
+                    with st.spinner(
+                        f"Optimizing · {opt_objective} · {opt_method} · "
+                        f"Budget: {fmt(opt_budget, '$')}..."
+                    ):
+                        result = optimize_budget(
+                            df_opt_in, opt_budget,
+                            objective=_obj_label,
+                            use_hill=use_hill_global,
+                            use_log=use_log_global,
+                            method=_method_label
+                        )
+
+                    spends_opt = result['spends']
+                    df_opt = df_opt_in.copy()
+                    df_opt['opt_spend']        = spends_opt
+                    df_opt['opt_revenue']      = [
+                        revenue_from_spend(spends_opt[i], df_opt.iloc[i],
+                                           use_hill_global, use_log_global)
+                        for i in range(len(df_opt))
+                    ]
+                    df_opt['opt_profit']       = df_opt['opt_revenue'] - df_opt['opt_spend']
+                    df_opt['opt_roi']          = df_opt['opt_revenue'] / df_opt['opt_spend'].replace(0, np.nan)
+                    df_opt['delta_spend']      = df_opt['opt_spend']   - df_opt['total_spend']
+                    df_opt['delta_profit']     = df_opt['opt_profit']  - df_opt['baseline_profit']
+                    df_opt['delta_revenue']    = df_opt['opt_revenue'] - df_opt['baseline_revenue']
+                    df_opt['delta_pct_spend']  = (df_opt['delta_spend']
+                                                  / df_opt['total_spend'].replace(0, np.nan) * 100)
+                    df_opt['opt_budget_used']  = opt_budget
+
+                    # ── Validate: check actual spends sum to budget ────────────
+                    _actual_total = float(np.sum(spends_opt))
+                    _budget_gap   = abs(_actual_total - opt_budget)
+                    if _budget_gap > opt_budget * 0.02:   # >2% gap = solver issue
+                        st.warning(
+                            f"⚠️ Optimizer allocated {fmt(_actual_total,'$')} "
+                            f"but budget was {fmt(opt_budget,'$')} "
+                            f"(gap: {fmt(_budget_gap,'$')}). "
+                            f"Try increasing Max% bounds or switching solver method.",
+                            icon="⚠️"
+                        )
+
+                    st.session_state[_opt_key]             = df_opt
+                    st.session_state['opt_result_df']      = df_opt
+                    st.session_state['opt_success']        = result['success']
+                    st.session_state['opt_message']        = result.get('message', '')
+                    st.session_state['opt_objective_used'] = opt_objective
+                    st.session_state['opt_method_used']    = opt_method
+                    st.session_state['opt_budget_used']    = opt_budget
+                    st.session_state['opt_budget_mode']    = budget_mode
+                
+                # ── Check if any channel exceeds its bounds ───────────────────
+                if not _run_blocked and 'df_opt' in dir():
+                    _bound_violations = []
+                    for idx, row in df_opt.iterrows():
+                        ch         = row['channel']
+                        base_spend = float(row['total_spend'])
+                        opt_spend  = float(row['opt_spend'])
+                        lo_pct     = float(row.get('lower_bound_pct', 0.5))
+                        hi_pct     = float(row.get('upper_bound_pct', 1.5))
+                        lo_bound   = base_spend * lo_pct
+                        hi_bound   = base_spend * hi_pct
+                        if opt_spend < lo_bound * 0.99:
+                            _bound_violations.append({'channel': ch, 'type': 'below',
+                                                       'actual': opt_spend, 'min': lo_bound, 'max': hi_bound})
+                        elif opt_spend > hi_bound * 1.01:
+                            _bound_violations.append({'channel': ch, 'type': 'above',
+                                                       'actual': opt_spend, 'min': lo_bound, 'max': hi_bound})
+                    st.session_state['opt_bound_violations'] = _bound_violations
+                elif _run_blocked:
+                    # Don't show stale results from a previous run
+                    st.session_state.pop(_opt_key, None)
+
+            if not isinstance(st.session_state.get(_opt_key), pd.DataFrame):
+                # No result yet — show placeholder and wait for Run click
+                _ph_surf = PALETTE["surface"]; _ph_bdr = PALETTE["border"]
+                _ph_txt  = PALETTE["text"];    _ph_mu  = PALETTE["muted"]
+                st.markdown(
+                    f"<div style='margin-top:2rem;text-align:center;padding:3rem;"
+                    f"background:{_ph_surf};border-radius:16px;border:2px dashed {_ph_bdr}'>"
+                    f"<div style='font-size:2rem;margin-bottom:1rem'>⚡</div>"
+                    f"<div style='font-size:1rem;font-weight:600;color:{_ph_txt};"
+                    f"margin-bottom:.5rem'>Configure settings and run optimization</div>"
+                    f"<div style='font-size:.82rem;color:{_ph_mu}'>"
+                    f"Supports Maximize Profit · Revenue · ROI with SLSQP &amp; "
+                    f"Differential Evolution</div></div>",
+                    unsafe_allow_html=True
+                )
+
+            if isinstance(st.session_state.get(_opt_key), pd.DataFrame):
+                df_opt            = st.session_state[_opt_key]
+                success_          = st.session_state.get('opt_success', True)
+                _bound_violations = st.session_state.get('opt_bound_violations', [])
 
             # Show which budget was actually used in this result
             _budget_used = float(df_opt.get('opt_budget_used', pd.Series([opt_budget])).iloc[0]) \
@@ -2933,21 +3992,23 @@ with tab_opt:
             _icon, _title, _desc = _obj_desc.get(_obj_used, ("⚡","",""))
             _budget_chip = "chip-gold" if _bmode_used == "Set new budget" else "chip-blue"
             _budget_label = f"New budget: {fmt(_budget_used, '$')}" if _bmode_used == "Set new budget" else f"Budget kept: {fmt(_budget_used, '$')}"
-            st.markdown(f"""
-            <div style='display:flex;align-items:flex-start;gap:.75rem;
-                        background:{PALETTE["surface"]};border:1.5px solid {PALETTE["border"]};
-                        border-radius:12px;padding:.8rem 1rem;margin-bottom:.75rem;
-                        box-shadow:0 1px 4px rgba(0,0,0,.04)'>
-                <div style='font-size:1.4rem;line-height:1'>{_icon}</div>
-                <div style='flex:1'>
-                    <div style='font-size:.78rem;font-weight:700;color:{PALETTE["text"]};margin-bottom:.2rem'>
-                        {_title} &nbsp;<span class='{_chip_cls} chip'>{_method_used}</span>
-                        &nbsp;<span class='{_budget_chip} chip'>{_budget_label}</span>
-                    </div>
-                    <div style='font-size:.76rem;color:{PALETTE["muted"]}'>{_desc}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            _banner_surf = PALETTE["surface"]; _banner_bdr = PALETTE["border"]
+            _banner_txt  = PALETTE["text"];    _banner_mu  = PALETTE["muted"]
+            st.markdown(
+                f"<div style='display:flex;align-items:flex-start;gap:.75rem;"
+                f"background:{_banner_surf};border:1.5px solid {_banner_bdr};"
+                f"border-radius:12px;padding:.8rem 1rem;margin-bottom:.75rem;"
+                f"box-shadow:0 1px 4px rgba(0,0,0,.04)'>"
+                f"<div style='font-size:1.4rem;line-height:1'>{_icon}</div>"
+                f"<div style='flex:1'>"
+                f"<div style='font-size:.78rem;font-weight:700;color:{_banner_txt};margin-bottom:.2rem'>"
+                f"{_title} &nbsp;<span class='{_chip_cls} chip'>{_method_used}</span>"
+                f"&nbsp;<span class='{_budget_chip} chip'>{_budget_label}</span>"
+                f"</div>"
+                f"<div style='font-size:.76rem;color:{_banner_mu}'>{_desc}</div>"
+                f"</div></div>",
+                unsafe_allow_html=True
+            )
 
             if not success_:
                 st.markdown(f"<div class='alert-box alert-warn'>⚠️ {st.session_state.get('opt_message', 'Solver did not fully converge. Showing best solution found.')}</div>",
@@ -2956,18 +4017,69 @@ with tab_opt:
                 _gekko_note = "  · GEKKO/IPOPT" if "GEKKO" in _method_used else ""
                 st.markdown(f"<div class='alert-box alert-success'>✅ Converged · {_obj_used} · {_method_used}{_gekko_note} · Budget: {fmt(_budget_used, '$')}</div>",
                             unsafe_allow_html=True)
+            
+            # ── Boundary Exceed Warning ───────────────────────────────────────
+            _show_results = True
+            if _bound_violations and (budget_mode == "Model recommends budget" or budget_mode == "Set new budget"):
+                # Build warning message with violation details
+                _violation_details = []
+                for v in _bound_violations:
+                    if v['type'] == 'below':
+                        _violation_details.append(
+                            f"• {v['channel']}: ${v['actual']:,.0f} is below minimum ${v['min']:,.0f}"
+                        )
+                    else:
+                        _violation_details.append(
+                            f"• {v['channel']}: ${v['actual']:,.0f} exceeds maximum ${v['max']:,.0f}"
+                        )
+                
+                st.markdown(
+                    f"<div class='alert-box alert-warn' style='font-size:.78rem;margin-top:.5rem'>"
+                    f"⚠️ <b>Channel Boundary Warning:</b> The optimization results exceed "
+                    f"the per-channel bounds for <b>{len(_bound_violations)} channel(s)</b>. "
+                    f"This may indicate that the selected budget cannot be fully optimized "
+                    f"within the specified channel constraints.<br><br>"
+                    f"<b>Violations:</b><br>" + "<br>".join(_violation_details) +
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                
+                # Ask user if they want to see the results
+                _proceed_key = f"proceed_with_violations_{_opt_key}"
+                st.markdown(
+                    f"<div style='font-size:.76rem;margin-top:.5rem;color:{PALETTE['text2']}'>"
+                    f"Do you still want to view the optimization results?</div>",
+                    unsafe_allow_html=True
+                )
+                _col_proceed_yes, _col_proceed_no = st.columns(2)
+                with _col_proceed_yes:
+                    _show_results = st.button("✅ Yes, show results", key=f"yes_{_opt_key}")
+                with _col_proceed_no:
+                    st.button("❌ No, hide results", key=f"no_{_opt_key}")
+                
+                # If user clicked No, hide results
+                if st.session_state.get(f"no_{_opt_key}", False):
+                    _show_results = False
+                    st.markdown(
+                        f"<div class='alert-box alert-info' style='font-size:.78rem;margin-top:.5rem'>"
+                        f"ℹ️ Results hidden due to boundary violations. "
+                        f"Try adjusting the budget or channel bounds to satisfy constraints.</div>",
+                        unsafe_allow_html=True
+                    )
+            
+            # Only show results if user confirmed or no violations
+            if _show_results:
+                # Result KPIs
+                new_rev    = df_opt['opt_revenue'].sum()
+                new_profit = df_opt['opt_profit'].sum()
+                new_spend  = df_opt['opt_spend'].sum()
+                new_roas   = new_rev / max(new_spend, EPS)
+                uplift_p   = new_profit - df_opt['baseline_profit'].sum()
+                uplift_r   = new_rev - df_opt['baseline_revenue'].sum()
 
-            # Result KPIs
-            new_rev    = df_opt['opt_revenue'].sum()
-            new_profit = df_opt['opt_profit'].sum()
-            new_spend  = df_opt['opt_spend'].sum()
-            new_roas   = new_rev / max(new_spend, EPS)
-            uplift_p   = new_profit - df_opt['baseline_profit'].sum()
-            uplift_r   = new_rev - df_opt['baseline_revenue'].sum()
-
-            rk1, rk2, rk3, rk4 = st.columns(4)
-            rk1.metric("Optimized Revenue", fmt(new_rev, "$"),
-                       delta=f"{fmt(uplift_r, '$', '+' if uplift_r >= 0 else '')}")
+                rk1, rk2, rk3, rk4 = st.columns(4)
+                rk1.metric("Optimized Revenue", fmt(new_rev, "$"),
+                           delta=f"{fmt(uplift_r, '$', '+' if uplift_r >= 0 else '')}")
             rk2.metric("Optimized Profit", fmt(new_profit, "$"),
                        delta=f"{fmt(uplift_p, '$', '+' if uplift_p >= 0 else '')}")
             rk3.metric("Optimized ROI", f"{new_roas:.2f}×",
@@ -3204,17 +4316,39 @@ with tab_opt:
 
             # Results table
             st.markdown(f"<div class='section-header'>Detailed results</div>", unsafe_allow_html=True)
-            display_cols = ['channel', 'total_spend', 'opt_spend', 'delta_spend', 'delta_pct_spend',
+
+            # Pre-compute bound columns from the df_opt_in bounds
+            df_opt['lower_bound_$'] = df_opt['total_spend'] * df_opt['lower_bound_pct'].astype(float)
+            df_opt['upper_bound_$'] = df_opt['total_spend'] * df_opt['upper_bound_pct'].astype(float)
+            # Locked channels: show "Locked" instead of a range
+            df_opt['_is_locked'] = df_opt['lock_spend'].astype(int) == 1
+
+            display_cols = ['channel', 'total_spend', 'lower_bound_$', 'upper_bound_$',
+                            'opt_spend', 'delta_spend', 'delta_pct_spend',
                             'baseline_revenue', 'opt_revenue', 'delta_revenue',
                             'baseline_profit', 'opt_profit', 'delta_profit', 'opt_roi']
             display_df = df_opt[display_cols].copy()
-            display_df.columns = ['Channel', 'Baseline Spend', 'Opt Spend', 'Δ Spend', 'Δ%',
+            display_df.columns = ['Channel', 'Baseline Spend', 'Min Bound', 'Max Bound',
+                                   'Opt Spend', 'Δ Spend', 'Δ%',
                                    'Baseline Rev', 'Opt Rev', 'Δ Rev',
                                    'Baseline Profit', 'Opt Profit', 'Δ Profit', 'ROI']
-            num_cols_fmt = ['Baseline Spend','Opt Spend','Δ Spend','Baseline Rev','Opt Rev','Δ Rev',
-                            'Baseline Profit','Opt Profit','Δ Profit']
+
+            num_cols_fmt = ['Baseline Spend', 'Opt Spend', 'Δ Spend',
+                            'Baseline Rev', 'Opt Rev', 'Δ Rev',
+                            'Baseline Profit', 'Opt Profit', 'Δ Profit']
             for c in num_cols_fmt:
                 display_df[c] = display_df[c].apply(lambda x: f"${x:,.0f}")
+
+            # Format bound columns — show "Locked" for locked channels
+            for i, row in df_opt.iterrows():
+                ch_idx = display_df.index[display_df['Channel'] == row['channel']]
+                if int(row.get('lock_spend', 0)) == 1:
+                    display_df.loc[ch_idx, 'Min Bound'] = '🔒 Locked'
+                    display_df.loc[ch_idx, 'Max Bound'] = '🔒 Locked'
+                else:
+                    display_df.loc[ch_idx, 'Min Bound'] = f"${float(row['lower_bound_$']):,.0f}"
+                    display_df.loc[ch_idx, 'Max Bound'] = f"${float(row['upper_bound_$']):,.0f}"
+
             # Cap display of Δ% — show ">1000%" for extreme cases to avoid visual noise
             def _fmt_dpct(x):
                 if abs(x) > 1000:
@@ -3225,7 +4359,11 @@ with tab_opt:
             st.dataframe(display_df, width='stretch', hide_index=True)
 
             buf = io.StringIO()
-            df_opt[display_cols].to_csv(buf, index=False)
+            _csv_cols = ['channel', 'total_spend', 'lower_bound_$', 'upper_bound_$',
+                         'opt_spend', 'delta_spend', 'delta_pct_spend',
+                         'baseline_revenue', 'opt_revenue', 'delta_revenue',
+                         'baseline_profit', 'opt_profit', 'delta_profit', 'opt_roi']
+            df_opt[_csv_cols].to_csv(buf, index=False)
             st.download_button("⬇️ Download optimization results (CSV)",
                                 data=buf.getvalue(),
                                 file_name="mmm_optimized_budget.csv",
@@ -3282,15 +4420,17 @@ with tab_opt:
 
 def _launch_empty_state(icon, title, subtitle):
     """Renders an empty-state placeholder card for launch tab modes."""
-    st.markdown(f"""
-    <div style='margin-top:2rem;text-align:center;padding:3rem;
-                background:{PALETTE["surface"]};border-radius:16px;
-                border:2px dashed {PALETTE["border"]}'>
-        <div style='font-size:2.5rem;margin-bottom:1rem'>{icon}</div>
-        <div style='font-size:1rem;font-weight:600;color:{PALETTE["text"]};margin-bottom:.5rem'>{title}</div>
-        <div style='font-size:.82rem;color:{PALETTE["muted"]}'>{subtitle}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    _les_surf = PALETTE["surface"]; _les_bdr = PALETTE["border"]
+    _les_txt  = PALETTE["text"];    _les_mu  = PALETTE["muted"]
+    st.markdown(
+        f"<div style='margin-top:2rem;text-align:center;padding:3rem;"
+        f"background:{_les_surf};border-radius:16px;border:2px dashed {_les_bdr}'>"
+        f"<div style='font-size:2.5rem;margin-bottom:1rem'>{icon}</div>"
+        f"<div style='font-size:1rem;font-weight:600;color:{_les_txt};margin-bottom:.5rem'>{title}</div>"
+        f"<div style='font-size:.82rem;color:{_les_mu}'>{subtitle}</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
 
 def _render_launch_results(df, spends, lb_total, objective, method,
@@ -5996,22 +7136,22 @@ with tab_ai:
 
 # ─── FOOTER ───────────────────────────────────────────────────────────────────
 st.markdown(f"<hr style='margin:2rem 0 1rem;border-color:{PALETTE['border']}'>", unsafe_allow_html=True)
-st.markdown(f"""
-<div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem'>
-    <div style='font-size:.7rem;color:{PALETTE["muted"]}'>
-        ⬡ <b style='color:{PALETTE["text"]}'>MMM Budget Optimizer</b> &nbsp;·&nbsp;
-        Power & Hill Response Curves &nbsp;·&nbsp;
-        Multi-Objective Optimization
-    </div>
-    <div style='display:flex;gap:.4rem;flex-wrap:wrap'>
-        <span class='chip chip-blue'>GEKKO / IPOPT</span>
-        <span class='chip chip-purple'>SLSQP · DE</span>
-        <span class='chip chip-green'>R-equivalent Hill Fit</span>
-        <span class='chip chip-gold'>Pharma Commercial</span>
-        <span class='chip chip-purple'>Google/Groq AI</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+_footer_mu  = PALETTE["muted"]; _footer_txt = PALETTE["text"]
+st.markdown(
+    f"<div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem'>"
+    f"<div style='font-size:.7rem;color:{_footer_mu}'>"
+    f"⬡ <b style='color:{_footer_txt}'>MMM Budget Optimizer</b> &nbsp;·&nbsp;"
+    f"Power &amp; Hill Response Curves &nbsp;·&nbsp; Multi-Objective Optimization"
+    f"</div>"
+    f"<div style='display:flex;gap:.4rem;flex-wrap:wrap'>"
+    f"<span class='chip chip-blue'>GEKKO / IPOPT</span>"
+    f"<span class='chip chip-purple'>SLSQP · DE</span>"
+    f"<span class='chip chip-green'>R-equivalent Hill Fit</span>"
+    f"<span class='chip chip-gold'>Pharma Commercial</span>"
+    f"<span class='chip chip-purple'>Google/Groq AI</span>"
+    f"</div></div>",
+    unsafe_allow_html=True
+)
 
 # ===================== CHANNEL-LEVEL BOUNDS FEASIBILITY (ADDED) =====================
 
